@@ -1,0 +1,28 @@
+# ---- 通用 ----
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+*.log
+.env
+.env.*
+
+# ---- imserver（Go）----
+imserver/bin/
+imserver/config.yaml
+imserver/*.test
+imserver/coverage.out
+
+# ---- imweb（Vite + React）----
+imweb/node_modules/
+imweb/dist/
+imweb/*.tsbuildinfo
+imweb/.vite/
+
+# ---- 打包产物 ----
+release/
+*.tar.gz
+*.zip
+SHA256SUMS

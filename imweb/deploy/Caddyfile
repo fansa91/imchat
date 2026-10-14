@@ -1,0 +1,24 @@
+# imweb + imserver（v0.2.0）。语音文件走独立的存储域名（见 imserver/deploy/Caddyfile.s3），本站点无需改动。
+im.fansa.ccwu.cc {
+    encode zstd gzip
+
+    # 接口和 WebSocket → imserver
+    @backend path /api/* /ws /healthz
+    handle @backend {
+        reverse_proxy 127.0.0.1:8092 {
+            stream_close_delay 5m
+        }
+    }
+
+    # 其余 → 网页
+    handle {
+        root * /var/www/imweb
+        try_files {path} /index.html
+        file_server
+
+        @assets path /assets/*
+        header @assets Cache-Control "public, max-age=31536000, immutable"
+        @html path / /index.html
+        header @html Cache-Control "no-cache"
+    }
+}

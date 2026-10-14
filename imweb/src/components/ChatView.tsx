@@ -1,0 +1,252 @@
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { store, type State } from '../store'
+import type { Message } from '../types'
+import { MSG_SYSTEM } from '../types'
+import { ConvAvatar } from './Avatar'
+import { Composer, type ComposerHandle } from './Composer'
+import { MessageItem } from './MessageItem'
+import { MessageMenu } from './MessageMenu'
+import { Icon } from '../icons'
+import { convTitle, dayLabel, displayName } from '../util'
+import { voiceKey } from '../voice'
+
+const GAP = 5 * 60 * 1000 // 超过 5 分钟显示时间分隔
+
+export function ChatView({ state, id, onBack, onInfo }: { state: State; id: number; onBack: () => void; onInfo: () => void }) {
+  const conv = state.convs[id]
+  const thread = state.threads[id]
+  const me = state.me!
+  const isGroup = conv?.type === 2
+  const typing = state.typing[id]
+  const typingOn = !!typing?.ts
+  const reads = state.reads[id] ?? {}
+  const scroller = useRef<HTMLDivElement>(null)
+  const stickBottom = useRef(true)
+  const prevHeight = useRef(0)
+  const prevFirst = useRef<number | undefined>(undefined)
+  const composer = useRef<ComposerHandle>(null)
+  const [replyTo, setReplyTo] = useState<Message | null>(null)
+  const [menu, setMenu] = useState<{ m: Message; rect: DOMRect } | null>(null)
+  const [flash, setFlash] = useState(0)
+  const [annHidden, setAnnHidden] = useState(() => localStorage.getItem(`im.ann.${id}`) === (conv?.announcement_at ?? ''))
+
+  useEffect(() => {
+    stickBottom.current = true
+    store.openConversation(id).catch(() => {})
+    if (window.matchMedia('(pointer: fine)').matches) composer.current?.focus()
+    return () => store.closeConversation()
+  }, [id])
+
+  useEffect(() => {
+    setAnnHidden(localStorage.getItem(`im.ann.${id}`) === (conv?.announcement_at ?? ''))
+  }, [id, conv?.announcement_at])
+
+  const items = thread?.items ?? []
+  const all: Message[] = [...items, ...(thread?.pending ?? [])]
+
+  // 保持滚动位置：新消息时贴底，加载历史时保持视口不跳
+  useLayoutEffect(() => {
+    const el = scroller.current
+    if (!el) return
+    const first = items[0]?.seq
+    if (prevFirst.current !== undefined && first !== undefined && first < prevFirst.current) {
+      el.scrollTop += el.scrollHeight - prevHeight.current
+    } else if (stickBottom.current) {
+      el.scrollTop = el.scrollHeight
+    }
+    prevFirst.current = first
+    prevHeight.current = el.scrollHeight
+  })
+
+  useEffect(() => {
+    if (document.visibilityState === 'visible') store.markRead(id)
+  }, [id, conv?.last_seq])
+
+  const onScroll = () => {
+    const el = scroller.current!
+    stickBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (el.scrollTop < 200) store.loadMore(id)
+  }
+
+  const nameOf = useCallback(
+    (uid: number) => (uid === me.id ? '你' : displayName(state.users[uid]) || '群成员'),
+    [state.users, me.id],
+  )
+
+  const jumpTo = useCallback(
+    async (seq: number) => {
+      stickBottom.current = false
+      const ok = await store.ensureLoaded(id, seq)
+      if (!ok) return store.showToast('原消息已不可见')
+      requestAnimationFrame(() => {
+        document.getElementById(`msg-${id}-${seq}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+        setFlash(seq)
+        setTimeout(() => setFlash((f) => (f === seq ? 0 : f)), 1600)
+      })
+    },
+    [id],
+  )
+
+  const onMenu = useCallback((m: Message, rect: DOMRect) => setMenu({ m, rect }), [])
+  const onReedit = useCallback((t: string) => composer.current?.setText(t), [])
+  const closeMenu = useCallback(() => setMenu(null), [])
+
+  // 已读：单聊看对方，群聊统计“N人已读”
+  const others = Object.entries(reads).filter(([uid]) => Number(uid) !== me.id)
+  const readCount = (seq: number) => others.filter(([, s]) => s >= seq).length
+  const memberCount = conv?.member_count ?? others.length + 1
+  const readLabel = (seq: number) => {
+    const n = readCount(seq)
+    if (!isGroup) return n > 0 ? '已读' : '已送达'
+    if (n === 0) return '已送达'
+    return n >= memberCount - 1 ? '全部已读' : `${n}人已读`
+  }
+
+  let lastMine = -1
+  all.forEach((m, i) => {
+    if (m.sender_id === me.id && m.msg_type !== MSG_SYSTEM && !m.recalled) lastMine = i
+  })
+
+  const subtitle = typingOn
+    ? isGroup
+      ? `${displayName(state.users[typing!.uid])} 正在输入…`
+      : '正在输入…'
+    : isGroup
+      ? `${conv?.member_count ?? ''} 位成员`
+      : conv?.peer?.email
+
+  const showAnn = isGroup && !!conv?.announcement && !annHidden
+
+  return (
+    <section className="pane chat-pane">
+      <header className="top-bar chat-bar">
+        <md-icon-button class="back-btn" aria-label="返回" onClick={onBack}>
+          <Icon name="back" />
+        </md-icon-button>
+        <ConvAvatar conv={conv} size={40} />
+        <div className="chat-title">
+          <div className="title-medium">{convTitle(conv)}</div>
+          <div className={'body-small ' + (typingOn ? 'accent' : 'muted')}>{subtitle}</div>
+        </div>
+        <div className="spacer" />
+        {isGroup && (
+          <md-icon-button aria-label="群聊信息" onClick={onInfo}>
+            <Icon name="info" />
+          </md-icon-button>
+        )}
+      </header>
+
+      {showAnn && (
+        <div className="announcement" role="note">
+          <Icon name="campaign" size={20} />
+          <button className="ann-text" onClick={onInfo} title="查看群公告">
+            {conv!.announcement}
+          </button>
+          <md-icon-button
+            aria-label="关闭公告"
+            onClick={() => {
+              localStorage.setItem(`im.ann.${id}`, conv?.announcement_at ?? '')
+              setAnnHidden(true)
+            }}
+          >
+            <Icon name="close" size={18} />
+          </md-icon-button>
+        </div>
+      )}
+
+      <div className="messages" ref={scroller} onScroll={onScroll}>
+        {thread?.loadingMore && (
+          <div className="center pad">
+            <md-circular-progress indeterminate style={{ '--md-circular-progress-size': '28px' } as any} />
+          </div>
+        )}
+        {thread && !thread.hasMore && items.length >= 50 && <div className="history-end">以上是全部消息</div>}
+        {!thread?.loaded && (
+          <div className="center grow">
+            <md-circular-progress indeterminate />
+          </div>
+        )}
+        {thread?.loaded && all.length === 0 && (
+          <div className="center grow muted">
+            <ConvAvatar conv={conv} size={72} />
+            <p>和 {convTitle(conv)} 打个招呼吧</p>
+          </div>
+        )}
+
+        {all.map((m, i) => {
+          const prev = all[i - 1]
+          const next = all[i + 1]
+          const t = new Date(m.created_at).getTime()
+          const showTime = !prev || t - new Date(prev.created_at).getTime() > GAP
+          const nextBreak = !next || new Date(next.created_at).getTime() - t > GAP
+          const plain = (x?: Message) => !!x && x.msg_type !== MSG_SYSTEM && !x.recalled
+          const first = showTime || !plain(prev) || prev.sender_id !== m.sender_id
+          const last = nextBreak || !plain(next) || next.sender_id !== m.sender_id
+          const replyOrig = m.reply_to ? items.find((x) => x.seq === m.reply_to!.seq) : undefined
+          return (
+            <div key={m.client_msg_id + ':' + m.sender_id}>
+              {showTime && <div className="time-sep">{dayLabel(m.created_at)}</div>}
+              <MessageItem
+                m={m}
+                meId={me.id}
+                isGroup={isGroup}
+                first={first}
+                last={last}
+                senderName={nameOf(m.sender_id)}
+                senderUser={state.users[m.sender_id]}
+                replyName={m.reply_to ? nameOf(m.reply_to.sender_id) : ''}
+                replyOrig={replyOrig}
+                voiceState={m.seq ? state.voice[voiceKey(id, m.seq)] : undefined}
+                highlighted={flash === m.seq && m.seq > 0}
+                onMenu={onMenu}
+                onJump={jumpTo}
+                onReedit={onReedit}
+              />
+              {i === lastMine && (
+                <div className="receipt">
+                  {m.status === 'sending' ? '发送中…' : m.status === 'failed' ? '发送失败' : readLabel(m.seq)}
+                </div>
+              )}
+            </div>
+          )
+        })}
+        {typingOn && (
+          <div className="row theirs first last">
+            <div className="bubble typing-bubble" aria-label="对方正在输入">
+              <span />
+              <span />
+              <span />
+            </div>
+          </div>
+        )}
+      </div>
+
+      <Composer
+        key={id}
+        ref={composer}
+        id={id}
+        replyTo={replyTo}
+        replyName={replyTo ? nameOf(replyTo.sender_id) : ''}
+        onCancelReply={() => setReplyTo(null)}
+        onSent={() => {
+          setReplyTo(null)
+          stickBottom.current = true
+        }}
+      />
+
+      {menu && (
+        <MessageMenu
+          m={menu.m}
+          rect={menu.rect}
+          reactions={state.config.reactions}
+          readInfo={menu.m.sender_id === me.id && menu.m.seq ? readLabel(menu.m.seq) : undefined}
+          onReply={(m) => {
+            setReplyTo(m)
+            composer.current?.focus()
+          }}
+          onClose={closeMenu}
+        />
+      )}
+    </section>
+  )
+}

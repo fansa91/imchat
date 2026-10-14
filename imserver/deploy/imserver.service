@@ -1,0 +1,22 @@
+# imserver systemd 服务 → /etc/systemd/system/imserver.service
+# 与仓库根目录 deploy/install.sh 生成的内容一致：程序和配置都在 /root/imserver，以 root 运行。
+# 注意：因为目录在 /root 下，不能开启 ProtectHome，否则 systemd 报 203/EXEC 或找不到配置。
+# SELinux 为 Enforcing 时还需：chcon -t bin_t /root/imserver/imserver
+[Unit]
+Description=imserver chat server
+After=network-online.target mysqld.service mysql.service mariadb.service redis.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/imserver
+ExecStart=/root/imserver/imserver -c /root/imserver/config.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

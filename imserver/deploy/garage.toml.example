@@ -1,0 +1,20 @@
+# Garage 单节点配置示例 → /etc/garage.toml（chmod 640, root:garage）
+# rpc_secret 用 openssl rand -hex 32 生成，替换下面的占位符
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "lmdb"                 # Garage 推荐；也可用 "sqlite"
+metadata_auto_snapshot_interval = "6h"
+
+replication_factor = 1             # 单节点
+
+rpc_bind_addr = "127.0.0.1:3901"   # 单节点只监听本机
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "REPLACE_WITH_openssl_rand_hex_32"
+
+[s3_api]
+s3_region = "garage"               # imserver 的 storage.region 要与此一致
+api_bind_addr = "127.0.0.1:3900"   # 只给本机 Caddy 反代；同 VCN 内网直连时改为 "0.0.0.0:3900" 并用安全列表限制来源
+root_domain = ".s3.fansa.ccwu.cc"  # 虚拟主机风格用；imserver 使用 path-style，不依赖它
+
+[admin]
+api_bind_addr = "127.0.0.1:3903"

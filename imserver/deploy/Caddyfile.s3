@@ -1,0 +1,11 @@
+# 存储机（Garage 所在的 A1）上的 Caddy：为浏览器和 imserver 提供 HTTPS。
+# 必须保留原始 Host（Caddy 默认就会透传），否则 S3 签名校验失败；不要加路径前缀。
+# CORS 由 imserver 启动时通过 S3 API 写入 bucket，Caddy 不要再加 CORS 头。
+s3.fansa.ccwu.cc {
+    reverse_proxy 127.0.0.1:3900 {
+        flush_interval -1
+    }
+    request_body {
+        max_size 10MB
+    }
+}

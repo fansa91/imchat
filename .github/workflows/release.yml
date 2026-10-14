@@ -1,0 +1,77 @@
+# 发布：推送 v* 标签（如 v0.2.0）时自动编译并创建 GitHub Release
+#   产物：imserver-<tag>-linux-amd64.tar.gz、imserver-<tag>-linux-arm64.tar.gz、
+#         imweb-<tag>-dist.tar.gz、SHA256SUMS
+#   deploy/install.sh 按这些文件名下载，改名时两边要一起改。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # 创建 Release、上传附件
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: imserver/go.mod
+          cache-dependency-path: imserver/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: imweb/package-lock.json
+
+      - name: 编译 imserver（CGO_ENABLED=0 静态二进制，注入版本号）
+        working-directory: imserver
+        run: |
+          go vet ./...
+          # Makefile: LDFLAGS = -s -w -X main.version=$(VERSION)
+          make linux-amd64 linux-arm64 VERSION="${TAG}"
+          file bin/* || true
+
+      - name: 构建 imweb
+        working-directory: imweb
+        run: |
+          npm ci --no-audit --no-fund
+          npx tsc -b
+          npx vite build
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+          mkdir -p release staging
+          for arch in amd64 arm64; do
+            name="imserver-${TAG}-linux-${arch}"
+            mkdir -p "staging/${name}/deploy"
+            cp "imserver/bin/imserver-linux-${arch}" "staging/${name}/imserver"
+            chmod 755 "staging/${name}/imserver"
+            cp imserver/config.example.yaml "staging/${name}/"
+            cp imserver/deploy/imserver.service "staging/${name}/deploy/"
+            tar -C staging -czf "release/${name}.tar.gz" "${name}"
+          done
+          web="imweb-${TAG}-dist"
+          mkdir -p "staging/${web}"
+          cp -r imweb/dist/. "staging/${web}/"
+          tar -C staging -czf "release/${web}.tar.gz" "${web}"
+          (cd release && sha256sum -- *.tar.gz > SHA256SUMS)
+          ls -l release && cat release/SHA256SUMS
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS

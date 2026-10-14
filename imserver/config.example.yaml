@@ -1,0 +1,63 @@
+# imserver 配置文件（v0.2.0）
+# 启动: ./imserver -c config.yaml
+
+server:
+  addr: ":8092"            # 监听地址（生产由 Caddy 反代到 127.0.0.1:8092）
+  node_id: "node-1"        # 节点名，多实例部署时每台不同
+  allow_origins: []        # WebSocket 允许的 Origin（Web 端才需要），留空不校验；如 ["https://im.fansa.ccwu.cc"]
+
+mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "im"
+  password: "change-me"
+  database: "im"
+  max_open_conns: 50
+  max_idle_conns: 10
+  conn_max_lifetime_seconds: 300
+  auto_migrate: true       # 启动时自动建表/升级（可重复执行，v0.1.0 的库可原地升级）
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+
+jwt:
+  secret: "请替换为至少32位的随机字符串-openssl-rand-hex-32"
+  ttl_hours: 720           # 登录有效期，默认 30 天
+
+# ---------- v0.2.0 新增 ----------
+
+group:
+  max_members: 500         # 群成员上限（含群主）
+
+message:
+  recall_seconds: 120      # 发送后多少秒内可以撤回
+
+# S3 兼容存储（推荐 Garage；MinIO 等其他 S3 也可用）。用于语音消息，后续图片也走这里。
+# 不需要语音时整段删掉（或 enabled: false）即可，其他功能不受影响。
+storage:
+  # 服务端访问存储的地址（host:port，不带 http://）。
+  #   存储在另一台机器（另一个地域）：填公网 HTTPS 域名，如 "s3.fansa.ccwu.cc:443" + use_ssl: true
+  #   同地域同 VCN：填存储机的内网 IP，如 "10.0.0.25:3900" + use_ssl: false
+  #   同一台机器：  "127.0.0.1:3900" + use_ssl: false
+  endpoint: "s3.fansa.ccwu.cc:443"
+  use_ssl: true
+  # 浏览器访问的地址，写进预签名 URL。必须是独立（子）域名，不能带路径（S3 签名包含路径）。
+  public_endpoint: "https://s3.fansa.ccwu.cc"
+  access_key: "GK..."      # garage key create 生成
+  secret_key: "..."
+  bucket: "imchat"         # Garage 需先 garage bucket create imchat
+  region: "garage"         # 必须与存储端一致：Garage 默认 garage，MinIO 默认 us-east-1
+  # 启动时设置 bucket CORS 允许的网页来源（留空则用 server.allow_origins，再空则 *）
+  cors_origins: ["https://im.fansa.ccwu.cc"]
+  voice_ttl_days: 7        # 服务器只保留语音 7 天（启动时自动设置 bucket 生命周期规则）；客户端收到后永久保存在本地
+  voice_max_seconds: 60    # 单条语音最长秒数
+  voice_max_bytes: 2097152 # 单条语音最大字节数（2MB）
+  set_lifecycle: true      # 启动时自动设置生命周期 + CORS（access key 需要 owner 权限）
+  verify_upload: true      # 发送语音时服务端检查对象大小与文件头（每条 2 次请求）；跨地域嫌慢可改 false
+  presign_put_seconds: 300 # 上传链接有效期
+  presign_get_seconds: 300 # 下载链接有效期
+
+log:
+  level: "info"            # debug | info | warn | error

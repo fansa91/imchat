@@ -1,0 +1,23 @@
+# Garage（S3 兼容存储）systemd 服务。放到 /etc/systemd/system/garage.service
+# 前提：二进制在 /usr/local/bin/garage，配置在 /etc/garage.toml，数据在 /var/lib/garage（属主 garage）
+[Unit]
+Description=Garage S3-compatible object storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=garage
+Group=garage
+Environment=RUST_LOG=garage=info
+ExecStart=/usr/local/bin/garage -c /etc/garage.toml server
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/garage
+
+[Install]
+WantedBy=multi-user.target

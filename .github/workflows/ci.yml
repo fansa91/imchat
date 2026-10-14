@@ -1,0 +1,51 @@
+# 持续集成：每次 push / PR 检查服务端能编译、网页能构建
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]   # 打 tag 时由 release.yml 负责
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  imserver:
+    name: imserver（go vet + go build）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: imserver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: imserver/go.mod
+          cache-dependency-path: imserver/go.sum
+      - name: go vet
+        run: go vet ./...
+      - name: go build（linux-amd64 / linux-arm64，静态编译）
+        run: |
+          make linux-amd64 linux-arm64 VERSION="ci-${GITHUB_SHA::7}"
+          ls -l bin/
+
+  imweb:
+    name: imweb（npm ci + tsc + vite build）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: imweb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: imweb/package-lock.json
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
+      - name: 类型检查（tsc）
+        run: npx tsc -b
+      - name: 构建（vite build）
+        run: npx vite build
