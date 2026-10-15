@@ -1,4 +1,4 @@
-import type { AuthResult, ClientConfig, Conversation, Member, Message, User } from './types'
+import type { AuthResult, ClientConfig, Conversation, Member, Message, Presence, User } from './types'
 
 export class ApiError extends Error {
   constructor(public status: number, public code: string, message: string) {
@@ -70,7 +70,15 @@ export const api = {
   setRole: (cid: number, uid: number, role: 'admin' | 'member') => req<{ ok: boolean }>('PUT', `/api/conversations/${cid}/members/${uid}/role`, { role }),
   leave: (cid: number) => req<{ ok: boolean }>('POST', `/api/conversations/${cid}/leave`),
   hidden: (cid: number, minSeq: number) => req<number[]>('GET', `/api/conversations/${cid}/hidden?min_seq=${minSeq}`),
-  presign: (body: { kind: 'voice'; mime: string; size: number; duration_ms: number }) =>
+  presign: (
+    body:
+      | { kind: 'voice'; mime: string; size: number; duration_ms: number }
+      | { kind: 'image'; mime: string; size: number; width: number; height: number },
+  ) =>
     req<{ key: string; url: string; method: string; headers: Record<string, string>; expires_at: string }>('POST', '/api/uploads/presign', body),
   media: (cid: number, seq: number) => req<{ url: string; mime: string; size: number }>('GET', `/api/conversations/${cid}/messages/${seq}/media`),
+  // v0.3.0
+  presence: (ids: number[]) => req<Presence[]>('GET', `/api/presence?ids=${ids.join(',')}`),
+  transcribe: (cid: number, seq: number) =>
+    req<{ text: string; cached: boolean }>('POST', `/api/conversations/${cid}/messages/${seq}/transcribe`),
 }

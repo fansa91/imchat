@@ -9,6 +9,7 @@ export interface User {
 export type MsgStatus = 'sending' | 'failed' | 'sent'
 
 export const MSG_TEXT = 1
+export const MSG_IMAGE = 2
 export const MSG_VOICE = 3
 export const MSG_SYSTEM = 10
 
@@ -51,6 +52,22 @@ export interface VoiceContent {
   duration_ms: number
   size: number
   waveform?: number[]
+}
+
+/** 图片消息 content（JSON），v0.3.0 */
+export interface ImageContent {
+  key: string
+  mime: string
+  size: number
+  width: number
+  height: number
+}
+
+/** 在线状态（GET /api/presence 与 WS presence 事件） */
+export interface Presence {
+  user_id: number
+  online: boolean
+  last_seen: string | null
 }
 
 /** 系统消息 content（JSON） */
@@ -100,6 +117,11 @@ export interface ClientConfig {
   voice_max_seconds?: number
   voice_max_bytes?: number
   voice_ttl_days?: number
+  // v0.3.0：旧服务端没有这些字段时隐藏对应功能
+  image_enabled?: boolean
+  image_max_bytes?: number
+  presence_enabled?: boolean
+  stt_enabled?: boolean
 }
 
 export interface AuthResult {

@@ -6,29 +6,41 @@
  */
 
 const DB_NAME = 'imweb'
-const STORE = 'voice'
+const STORES = ['voice', 'image', 'transcript'] as const
+type StoreName = (typeof STORES)[number]
 let dbp: Promise<IDBDatabase> | null = null
 
+/** v1 只有 voice；v2（0.3.0）新增 image（图片永久缓存）与 transcript（语音转文字结果） */
 function db(): Promise<IDBDatabase> {
   if (!dbp) {
     dbp = new Promise((resolve, reject) => {
-      const r = indexedDB.open(DB_NAME, 1)
+      const r = indexedDB.open(DB_NAME, 2)
       r.onupgradeneeded = () => {
-        if (!r.result.objectStoreNames.contains(STORE)) r.result.createObjectStore(STORE)
+        for (const s of STORES) if (!r.result.objectStoreNames.contains(s)) r.result.createObjectStore(s)
       }
-      r.onsuccess = () => resolve(r.result)
-      r.onerror = () => reject(r.error)
+      r.onsuccess = () => {
+        const d = r.result
+        d.onversionchange = () => {
+          d.close()
+          dbp = null
+        }
+        resolve(d)
+      }
+      r.onerror = () => {
+        dbp = null
+        reject(r.error)
+      }
     })
   }
   return dbp
 }
 
-function tx<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T>): Promise<T> {
+function tx<T>(store: StoreName, mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T>): Promise<T> {
   return db().then(
     (d) =>
       new Promise<T>((resolve, reject) => {
-        const t = d.transaction(STORE, mode)
-        const req = fn(t.objectStore(STORE))
+        const t = d.transaction(store, mode)
+        const req = fn(t.objectStore(store))
         req.onsuccess = () => resolve(req.result)
         req.onerror = () => reject(req.error)
       }),
@@ -37,12 +49,20 @@ function tx<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T
 
 export const voiceKey = (cid: number, seq: number) => `${cid}:${seq}`
 
-export const voiceDB = {
-  get: (k: string) => tx<Blob | undefined>('readonly', (s) => s.get(k) as IDBRequest<Blob | undefined>),
-  put: (k: string, b: Blob) => tx('readwrite', (s) => s.put(b, k)),
-  del: (k: string) => tx('readwrite', (s) => s.delete(k)),
-  has: (k: string) => tx<number>('readonly', (s) => s.count(k)).then((n) => n > 0),
+function kv<V>(store: StoreName) {
+  return {
+    get: (k: string) => tx<V | undefined>(store, 'readonly', (s) => s.get(k) as IDBRequest<V | undefined>),
+    put: (k: string, v: V) => tx(store, 'readwrite', (s) => s.put(v, k)),
+    del: (k: string) => tx(store, 'readwrite', (s) => s.delete(k)),
+    has: (k: string) => tx<number>(store, 'readonly', (s) => s.count(k)).then((n) => n > 0),
+  }
 }
+
+export const voiceDB = kv<Blob>('voice')
+/** 图片永久缓存，键同语音：`会话ID:seq` */
+export const imageDB = kv<Blob>('image')
+/** 语音转文字结果缓存，键同语音 */
+export const transcriptDB = kv<string>('transcript')
 
 /** 申请持久化存储，避免浏览器空间紧张时清掉本地语音 */
 export async function requestPersist() {

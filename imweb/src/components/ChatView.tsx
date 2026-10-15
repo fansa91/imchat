@@ -7,7 +7,7 @@ import { Composer, type ComposerHandle } from './Composer'
 import { MessageItem } from './MessageItem'
 import { MessageMenu } from './MessageMenu'
 import { Icon } from '../icons'
-import { convTitle, dayLabel, displayName } from '../util'
+import { convTitle, dayLabel, displayName, presenceText } from '../util'
 import { voiceKey } from '../voice'
 
 const GAP = 5 * 60 * 1000 // 超过 5 分钟显示时间分隔
@@ -28,6 +28,8 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
   const [replyTo, setReplyTo] = useState<Message | null>(null)
   const [menu, setMenu] = useState<{ m: Message; rect: DOMRect } | null>(null)
   const [flash, setFlash] = useState(0)
+  const [dragging, setDragging] = useState(false)
+  const dragDepth = useRef(0)
   const [annHidden, setAnnHidden] = useState(() => localStorage.getItem(`im.ann.${id}`) === (conv?.announcement_at ?? ''))
 
   useEffect(() => {
@@ -107,26 +109,82 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
     if (m.sender_id === me.id && m.msg_type !== MSG_SYSTEM && !m.recalled) lastMine = i
   })
 
+  // 在线状态（服务端 presence_enabled 时）
+  const presenceOn = !!state.config.presence_enabled
+  const peerPresence = !isGroup && conv?.peer ? state.presence[conv.peer.id] : undefined
+  let groupOnline = 0
+  if (presenceOn && isGroup) {
+    const ids = new Set<number>((state.members[id]?.map((x) => x.user.id) ?? conv?.members_preview?.map((u) => u.id)) ?? [])
+    ids.delete(me.id)
+    for (const u of ids) if (state.presence[u]?.online) groupOnline++
+    if (state.conn === 'online') groupOnline++ // 自己
+  }
   const subtitle = typingOn
     ? isGroup
       ? `${displayName(state.users[typing!.uid])} 正在输入…`
       : '正在输入…'
     : isGroup
-      ? `${conv?.member_count ?? ''} 位成员`
-      : conv?.peer?.email
+      ? `${conv?.member_count ?? ''} 位成员` + (presenceOn && groupOnline ? ` · ${groupOnline} 人在线` : '')
+      : (presenceOn && presenceText(peerPresence)) || conv?.peer?.email
+
+  const imageOn = !!state.config.image_enabled
+  const sendFiles = useCallback(
+    (files: File[]) => {
+      const imgs = files.filter((f) => f.type.startsWith('image/'))
+      if (!imgs.length) return store.showToast('只能发送图片')
+      const reply = replyTo?.seq
+      for (const f of imgs.slice(0, 9)) store.sendImage(id, f, reply)
+      if (imgs.length > 9) store.showToast('一次最多发送 9 张图片')
+      setReplyTo(null)
+      stickBottom.current = true
+    },
+    [id, replyTo],
+  )
+  const hasFiles = (e: React.DragEvent) => imageOn && [...e.dataTransfer.types].includes('Files')
 
   const showAnn = isGroup && !!conv?.announcement && !annHidden
 
   return (
-    <section className="pane chat-pane">
+    <section
+      className="pane chat-pane"
+      onDragEnter={(e) => {
+        if (!hasFiles(e)) return
+        e.preventDefault()
+        dragDepth.current++
+        setDragging(true)
+      }}
+      onDragOver={(e) => {
+        if (!hasFiles(e)) return
+        e.preventDefault()
+        e.dataTransfer.dropEffect = 'copy'
+      }}
+      onDragLeave={(e) => {
+        if (!hasFiles(e)) return
+        dragDepth.current = Math.max(0, dragDepth.current - 1)
+        if (!dragDepth.current) setDragging(false)
+      }}
+      onDrop={(e) => {
+        if (!hasFiles(e)) return
+        e.preventDefault()
+        dragDepth.current = 0
+        setDragging(false)
+        sendFiles([...e.dataTransfer.files])
+      }}
+    >
+      {dragging && (
+        <div className="drop-overlay" aria-hidden="true">
+          <Icon name="image" size={48} />
+          <span className="title-medium">松开发送图片</span>
+        </div>
+      )}
       <header className="top-bar chat-bar">
         <md-icon-button class="back-btn" aria-label="返回" onClick={onBack}>
           <Icon name="back" />
         </md-icon-button>
-        <ConvAvatar conv={conv} size={40} />
+        <ConvAvatar conv={conv} size={40} online={presenceOn && !!peerPresence?.online} />
         <div className="chat-title">
           <div className="title-medium">{convTitle(conv)}</div>
-          <div className={'body-small ' + (typingOn ? 'accent' : 'muted')}>{subtitle}</div>
+          <div className={'body-small ' + (typingOn || (presenceOn && peerPresence?.online) ? 'accent' : 'muted')}>{subtitle}</div>
         </div>
         <div className="spacer" />
         {isGroup && (
@@ -197,6 +255,7 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
                 replyName={m.reply_to ? nameOf(m.reply_to.sender_id) : ''}
                 replyOrig={replyOrig}
                 voiceState={m.seq ? state.voice[voiceKey(id, m.seq)] : undefined}
+                transcript={m.seq ? state.transcripts[voiceKey(id, m.seq)] : undefined}
                 highlighted={flash === m.seq && m.seq > 0}
                 onMenu={onMenu}
                 onJump={jumpTo}
@@ -232,6 +291,7 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
           setReplyTo(null)
           stickBottom.current = true
         }}
+        onFiles={sendFiles}
       />
 
       {menu && (

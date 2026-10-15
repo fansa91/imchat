@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { store } from '../store'
 import type { Message } from '../types'
-import { MSG_TEXT, MSG_VOICE } from '../types'
+import { shortPreview } from '../util'
 import { Icon } from '../icons'
 import { canRecord, fmtDuration, Recorder } from '../voice'
 
@@ -22,7 +22,8 @@ export const Composer = forwardRef<ComposerHandle, {
   replyName: string
   onCancelReply: () => void
   onSent: () => void
-}>(function Composer({ id, replyTo, replyName, onCancelReply, onSent }, ref) {
+  onFiles: (files: File[]) => void
+}>(function Composer({ id, replyTo, replyName, onCancelReply, onSent, onFiles }, ref) {
   const [text, setText] = useState(() => drafts.get(id) ?? '')
   const input = useRef<HTMLTextAreaElement>(null)
   const cfg = store.get().config
@@ -30,6 +31,7 @@ export const Composer = forwardRef<ComposerHandle, {
   const [rec, setRec] = useState<null | { elapsed: number; levels: number[]; holding: boolean; cancelHint: boolean }>(null)
   const recorder = useRef<Recorder | null>(null)
   const hold = useRef<{ start: number; x: number } | null>(null)
+  const fileInput = useRef<HTMLInputElement>(null)
   const tapModeAt = useRef(0) // 进入点按录音模式的时间，用于忽略同一次点按产生的“幽灵点击”
 
   useImperativeHandle(ref, () => ({
@@ -50,6 +52,15 @@ export const Composer = forwardRef<ComposerHandle, {
     drafts.delete(id)
     onSent()
     input.current?.focus()
+  }
+
+  // 粘贴图片（截图 / 复制的图片）直接发送
+  const onPaste = (e: React.ClipboardEvent) => {
+    if (!cfg.image_enabled) return
+    const files = [...e.clipboardData.files].filter((f) => f.type.startsWith('image/'))
+    if (!files.length) return
+    e.preventDefault()
+    onFiles(files)
   }
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -128,7 +139,7 @@ export const Composer = forwardRef<ComposerHandle, {
           <Icon name="reply" size={18} />
           <div className="reply-bar-text">
             <span className="reply-bar-name">回复 {replyName}</span>
-            <span className="reply-bar-preview">{replyTo.msg_type === MSG_TEXT ? replyTo.content : replyTo.msg_type === MSG_VOICE ? '[语音]' : '[消息]'}</span>
+            <span className="reply-bar-preview">{shortPreview(replyTo.msg_type, replyTo.content)}</span>
           </div>
           <md-icon-button aria-label="取消回复" onClick={onCancelReply}>
             <Icon name="close" size={20} />
@@ -136,6 +147,25 @@ export const Composer = forwardRef<ComposerHandle, {
         </div>
       )}
       <div className="composer">
+        {cfg.image_enabled && !rec && (
+          <>
+            <md-icon-button class="image-btn" aria-label="发送图片" title="发送图片（也可粘贴或拖入）" onClick={() => fileInput.current?.click()}>
+              <Icon name="image" />
+            </md-icon-button>
+            <input
+              ref={fileInput}
+              type="file"
+              accept="image/jpeg,image/png,image/webp,image/gif,image/*"
+              multiple
+              hidden
+              onChange={(e) => {
+                const files = [...(e.target.files ?? [])]
+                e.target.value = ''
+                if (files.length) onFiles(files)
+              }}
+            />
+          </>
+        )}
         {rec ? (
           <div className={'recording' + (rec.cancelHint ? ' cancel' : '')} aria-live="polite">
             <div className="rec-row">
@@ -171,6 +201,7 @@ export const Composer = forwardRef<ComposerHandle, {
                 if (e.target.value) store.sendTyping(id)
               }}
               onKeyDown={onKey}
+              onPaste={onPaste}
               enterKeyHint="send"
             />
           </div>

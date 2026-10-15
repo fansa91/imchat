@@ -46,7 +46,16 @@ export function ConversationList({
         ) : (
           <ul className="conv-list" role="list">
             {list.map((c) => (
-              <ConvItem key={c.id} c={c} active={c.id === activeId} typing={!!state.typing[c.id]?.ts} meId={state.me?.id} users={state.users} onOpen={onOpen} />
+              <ConvItem
+                key={c.id}
+                c={c}
+                active={c.id === activeId}
+                typing={!!state.typing[c.id]?.ts}
+                online={c.type !== 2 && !!c.peer && !!state.presence[c.peer.id]?.online}
+                meId={state.me?.id}
+                users={state.users}
+                onOpen={onOpen}
+              />
             ))}
           </ul>
         )}
@@ -63,6 +72,7 @@ function ConvItem({
   c,
   active,
   typing,
+  online,
   meId,
   users,
   onOpen,
@@ -70,6 +80,7 @@ function ConvItem({
   c: Conversation
   active: boolean
   typing: boolean
+  online: boolean
   meId?: number
   users: State['users']
   onOpen: (id: number) => void
@@ -92,7 +103,7 @@ function ConvItem({
       <button className={'conv-item' + (active ? ' active' : '')} onClick={() => onOpen(c.id)}>
         <md-ripple />
         <md-focus-ring style={{ '--md-focus-ring-shape': '28px' } as any} />
-        <ConvAvatar conv={c} size={48} />
+        <ConvAvatar conv={c} size={48} online={online} />
         <div className="conv-main">
           <div className="conv-row">
             <span className={'conv-name' + (c.unread ? ' bold' : '')}>{name}</span>

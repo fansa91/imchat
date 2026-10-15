@@ -1,8 +1,10 @@
 import { api, ApiError, getToken, setToken, setUnauthorizedHandler } from './api'
 import { Socket } from './socket'
-import { MSG_SYSTEM, MSG_TEXT, MSG_VOICE } from './types'
-import type { ClientConfig, Conversation, Member, Message, Reaction, SystemContent, User, VoiceContent } from './types'
-import { requestPersist, voiceDB, voiceKey, type Recording } from './voice'
+import { MSG_IMAGE, MSG_SYSTEM, MSG_TEXT, MSG_VOICE } from './types'
+import type { ClientConfig, Conversation, ImageContent, Member, Message, Presence, Reaction, SystemContent, User, VoiceContent } from './types'
+import { imageDB, requestPersist, transcriptDB, voiceDB, voiceKey, type Recording } from './voice'
+import { prepareImage } from './image'
+import { shortPreview } from './util'
 
 export interface Thread {
   items: Message[] // 服务端已确认的消息，按 seq 升序
@@ -16,6 +18,19 @@ export interface Thread {
 /** 语音本地状态：none 未知 / loading 下载中 / ready 本地有 / expired 服务器已过期且本地没有 / error */
 export type VoiceState = 'loading' | 'ready' | 'expired' | 'error'
 
+/** 语音转文字：loading 转写中；text 有结果 */
+export interface Transcript {
+  loading?: boolean
+  text?: string
+}
+
+/** 图片下载失败：expired 服务器已删除（撤回 / 过期），其他为 error */
+export class MediaError extends Error {
+  constructor(public kind: 'expired' | 'error') {
+    super(kind)
+  }
+}
+
 export interface State {
   me: User | null
   booting: boolean
@@ -28,6 +43,8 @@ export interface State {
   users: Record<number, User> // 已知用户（群成员名字/头像）
   members: Record<number, Member[]> // 已加载的群成员
   voice: Record<string, VoiceState> // voiceKey -> 状态
+  presence: Record<number, Presence> // 用户 -> 在线状态
+  transcripts: Record<string, Transcript> // voiceKey -> 转文字结果
   toast: string
 }
 
@@ -39,6 +56,15 @@ const uuid = () =>
   (crypto as any).randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
 
 const emptyThread = (): Thread => ({ items: [], pending: [], loaded: false, hasMore: true, loadingMore: false, modSeq: 0 })
+
+export function parseImage(m: Message): ImageContent | null {
+  if (m.msg_type !== MSG_IMAGE || m.recalled) return null
+  try {
+    return JSON.parse(m.content)
+  } catch {
+    return null
+  }
+}
 
 export function parseVoice(m: Message): VoiceContent | null {
   if (m.msg_type !== MSG_VOICE || m.recalled) return null
@@ -61,6 +87,8 @@ const initial = (): State => ({
   users: {},
   members: {},
   voice: {},
+  presence: {},
+  transcripts: {},
   toast: '',
 })
 
@@ -74,6 +102,9 @@ class Store {
   private blobUrls = new Map<string, string>()
   private downloadQueue: { cid: number; seq: number }[] = []
   private downloading = 0
+  /** 进行中的图片加载（去重） */
+  private imageLoads = new Map<string, Promise<string>>()
+  private configReady: Promise<void> = Promise.resolve()
   /** 自己撤回的文本，用于“重新编辑” */
   recalledDrafts = new Map<string, string>()
   activeId: number | null = null
@@ -91,6 +122,7 @@ class Store {
     this.socket.on('deleted', (d) => this.onDeleted(d.conversation_id, d.seqs))
     this.socket.on('conversation_updated', (d) => this.refreshConversation(d.conversation_id))
     this.socket.on('conversation_removed', (d) => this.dropConversation(d.conversation_id))
+    this.socket.on('presence', (d: Presence) => this.applyPresence([d]))
     this.socket.on('error', (d, id) => {
       if (id && this.timers.has(id)) this.failPending(id)
       else if (id) this.showToast(d?.message || '操作失败')
@@ -155,7 +187,10 @@ class Store {
   private afterLogin() {
     this.socket.start()
     requestPersist()
-    api.config().then((config) => this.set({ config })).catch(() => {})
+    this.configReady = api
+      .config()
+      .then((config) => this.set({ config: { ...DEFAULT_CONFIG, ...config } }))
+      .catch(() => {})
     this.loadConversations().catch(() => {})
   }
 
@@ -175,6 +210,7 @@ class Store {
     this.blobUrls.forEach((u) => URL.revokeObjectURL(u))
     this.blobUrls.clear()
     this.blobs.clear()
+    this.imageLoads.clear()
     this.set({ ...initial(), booting: false })
   }
 
@@ -215,6 +251,7 @@ class Store {
   private async sync() {
     try {
       await this.loadConversations()
+      this.refreshPresence()
       for (const [idStr, t] of Object.entries(this.state.threads)) {
         const id = Number(idStr)
         if (!t.loaded) continue
@@ -296,6 +333,7 @@ class Store {
       const list = await api.members(id)
       this.addUsers(list.map((m) => m.user))
       this.set({ members: { ...this.state.members, [id]: list } })
+      this.loadPresence(list.map((m) => m.user.id).filter((u) => !this.state.presence[u]))
       return list
     } catch {
       return []
@@ -417,6 +455,44 @@ class Store {
     for (const m of msgs) if (m.msg_type === MSG_VOICE && !m.recalled) this.ensureVoice(m)
   }
 
+  // ---------- 在线状态 ----------
+
+  /** 登录 / 重连后：对所有已知会话成员批量拉取在线状态 */
+  private async refreshPresence() {
+    await this.configReady
+    if (!this.state.config.presence_enabled) return
+    const ids = new Set<number>()
+    for (const c of Object.values(this.state.convs)) {
+      if (c.peer) ids.add(c.peer.id)
+      for (const u of c.members_preview ?? []) ids.add(u.id)
+    }
+    for (const list of Object.values(this.state.members)) for (const m of list) ids.add(m.user.id)
+    if (this.state.me) ids.delete(this.state.me.id)
+    await this.loadPresence([...ids])
+  }
+
+  private async loadPresence(ids: number[]) {
+    await this.configReady
+    if (!this.state.config.presence_enabled) return
+    const me = this.state.me?.id
+    ids = [...new Set(ids)].filter((i) => i && i !== me)
+    for (let i = 0; i < ids.length; i += 200) {
+      try {
+        this.applyPresence(await api.presence(ids.slice(i, i + 200)))
+      } catch (e) {
+        console.warn('presence failed', e)
+        return
+      }
+    }
+  }
+
+  private applyPresence(list: Presence[]) {
+    if (!list?.length) return
+    const presence = { ...this.state.presence }
+    for (const p of list) if (p && p.user_id) presence[p.user_id] = { user_id: p.user_id, online: !!p.online, last_seen: p.last_seen ?? null }
+    this.set({ presence })
+  }
+
   /** 用新版本替换已加载的消息（撤回、回应变化） */
   private replaceMessages(id: number, msgs: Message[]) {
     if (!msgs.length) return
@@ -424,7 +500,7 @@ class Store {
     this.patchThread(id, (t) => ({ ...t, items: t.items.map((m) => (by.has(m.seq) ? { ...by.get(m.seq)!, status: 'sent' } : m)) }))
     const c = this.state.convs[id]
     if (c?.last_message && by.has(c.last_message.seq)) this.patchConv(id, { last_message: by.get(c.last_message.seq) })
-    for (const m of msgs) if (m.recalled) this.forgetVoice(id, m.seq)
+    for (const m of msgs) if (m.recalled) this.forgetMedia(id, m.seq)
   }
 
   send(id: number, text: string, replyToSeq?: number) {
@@ -453,7 +529,7 @@ class Store {
   private replyPreviewFor(id: number, seq: number) {
     const o = this.state.threads[id]?.items.find((m) => m.seq === seq)
     if (!o) return undefined
-    return { seq, sender_id: o.sender_id, msg_type: o.msg_type, preview: o.msg_type === MSG_TEXT ? o.content.slice(0, 80) : '[语音]', recalled: !!o.recalled }
+    return { seq, sender_id: o.sender_id, msg_type: o.msg_type, preview: shortPreview(o.msg_type, o.content).slice(0, 80), recalled: !!o.recalled }
   }
 
   /** 语音：先占位显示，上传到对象存储（预签名 PUT）后再通过 WebSocket 发送 */
@@ -465,9 +541,31 @@ class Store {
     await this.uploadAndSend(m)
   }
 
+  /** 图片：本地压缩 → 先占位显示 → 预签名上传 → WebSocket 发送（与语音同一流程） */
+  async sendImage(id: number, file: File | Blob, replyToSeq?: number) {
+    if (!this.state.me) return
+    const cfg = this.state.config
+    if (!cfg.image_enabled) return this.showToast('服务器未开启图片消息')
+    if (file.type && !file.type.startsWith('image/')) return this.showToast('只能发送图片')
+    let img
+    try {
+      img = await prepareImage(file)
+    } catch (e) {
+      console.warn('prepare image', e)
+      return this.showToast('无法读取这张图片')
+    }
+    const max = cfg.image_max_bytes ?? 10 * 1024 * 1024
+    if (img.blob.size > max) return this.showToast(`图片不能超过 ${Math.round((max / 1048576) * 10) / 10} MB`)
+    const local: ImageContent = { key: '', mime: img.mime, size: img.blob.size, width: img.width, height: img.height }
+    const m = this.addPending(id, MSG_IMAGE, JSON.stringify(local), replyToSeq)
+    this.blobs.set(m.client_msg_id, img.blob)
+    await this.uploadAndSend(m)
+  }
+
   private async uploadAndSend(m: Message) {
     const blob = this.blobs.get(m.client_msg_id)
-    let vc: VoiceContent
+    const isImage = m.msg_type === MSG_IMAGE
+    let vc: VoiceContent & ImageContent
     try {
       vc = JSON.parse(m.content)
     } catch {
@@ -476,12 +574,16 @@ class Store {
     if (!vc.key) {
       if (!blob) return this.failPending(m.client_msg_id)
       try {
-        const pre = await api.presign({ kind: 'voice', mime: vc.mime, size: blob.size, duration_ms: vc.duration_ms })
+        const pre = await api.presign(
+          isImage
+            ? { kind: 'image', mime: vc.mime, size: blob.size, width: vc.width, height: vc.height }
+            : { kind: 'voice', mime: vc.mime, size: blob.size, duration_ms: vc.duration_ms },
+        )
         const res = await fetch(pre.url, { method: 'PUT', headers: pre.headers, body: blob })
         if (!res.ok) throw new Error(`上传失败 (${res.status})`)
         vc = { ...vc, key: pre.key }
       } catch (e) {
-        this.showToast(e instanceof ApiError ? e.message : '语音上传失败')
+        this.showToast(e instanceof ApiError ? e.message : isImage ? '图片上传失败' : '语音上传失败')
         return this.failPending(m.client_msg_id)
       }
       const content = JSON.stringify(vc)
@@ -499,14 +601,14 @@ class Store {
       ...t,
       pending: t.pending.map((p) => (p.client_msg_id === m.client_msg_id ? { ...p, status: 'sending' } : p)),
     }))
-    if (m.msg_type === MSG_VOICE) this.uploadAndSend(m)
+    if (m.msg_type === MSG_VOICE || m.msg_type === MSG_IMAGE) this.uploadAndSend(m)
     else this.transmit(m)
   }
 
   /** 发出（或重发同一个 client_msg_id，服务端保证幂等） */
   private transmit(m: Message) {
     clearTimeout(this.timers.get(m.client_msg_id))
-    if (m.msg_type === MSG_VOICE) {
+    if (m.msg_type === MSG_VOICE || m.msg_type === MSG_IMAGE) {
       try {
         if (!JSON.parse(m.content).key) return // 还没上传完
       } catch {}
@@ -551,6 +653,18 @@ class Store {
       this.blobs.set(k, blob)
       this.set({ voice: { ...this.state.voice, [k]: 'ready' } })
       voiceDB.put(k, blob).catch((e) => console.warn('save voice', e))
+    }
+    // 自己发的图片：压缩后的 Blob 直接存入 IndexedDB
+    if (blob && m.msg_type === MSG_IMAGE) {
+      const k = voiceKey(m.conversation_id, m.seq)
+      this.blobs.delete(m.client_msg_id)
+      this.blobs.set(k, blob)
+      const u = this.blobUrls.get(m.client_msg_id)
+      if (u) {
+        this.blobUrls.delete(m.client_msg_id)
+        this.blobUrls.set(k, u)
+      }
+      imageDB.put(k, blob).catch((e) => console.warn('save image', e))
     }
     this.ingest(m, true)
   }
@@ -673,7 +787,7 @@ class Store {
     else {
       const c = this.state.convs[id]
       if (c?.last_message?.seq === m.seq) this.patchConv(id, { last_message: m })
-      this.forgetVoice(id, m.seq)
+      this.forgetMedia(id, m.seq)
     }
     // 引用了这条消息的回复也要更新预览
     if (t?.loaded) {
@@ -717,7 +831,7 @@ class Store {
       if (items.length) this.patchConv(cid, { last_message: items[items.length - 1] })
       else this.refreshConversation(cid)
     }
-    for (const s of seqs) this.forgetVoice(cid, s)
+    for (const s of seqs) this.forgetMedia(cid, s)
   }
 
   // ---------- 语音本地缓存 ----------
@@ -725,6 +839,7 @@ class Store {
   /** 确保语音在本地：IndexedDB 有就标记 ready，否则排队下载 */
   private async ensureVoice(m: Message) {
     const k = voiceKey(m.conversation_id, m.seq)
+    this.loadTranscript(k)
     if (this.state.voice[k] === 'ready' || this.state.voice[k] === 'loading') return
     try {
       if (await voiceDB.has(k)) {
@@ -788,13 +903,111 @@ class Store {
     return u
   }
 
-  private forgetVoice(cid: number, seq: number) {
+  /** 撤回 / 删除：清理本地语音、图片和转文字缓存 */
+  private forgetMedia(cid: number, seq: number) {
     const k = voiceKey(cid, seq)
     const u = this.blobUrls.get(k)
     if (u) URL.revokeObjectURL(u)
     this.blobUrls.delete(k)
     this.blobs.delete(k)
+    this.imageLoads.delete(k)
     voiceDB.del(k).catch(() => {})
+    imageDB.del(k).catch(() => {})
+    transcriptDB.del(k).catch(() => {})
+    if (this.state.transcripts[k]) {
+      const transcripts = { ...this.state.transcripts }
+      delete transcripts[k]
+      this.set({ transcripts })
+    }
+  }
+
+  // ---------- 图片本地缓存 ----------
+
+  /**
+   * 显示用的本地 URL：内存 → IndexedDB → 下载（存入 IndexedDB 永久保存）。
+   * 失败抛 MediaError（expired：已撤回 / 已删除）。
+   */
+  imageUrl(m: Message): Promise<string> {
+    const k = m.seq ? voiceKey(m.conversation_id, m.seq) : m.client_msg_id
+    const cached = this.blobUrls.get(k)
+    if (cached) return Promise.resolve(cached)
+    let p = this.imageLoads.get(k)
+    if (!p) {
+      p = this.loadImage(m, k).finally(() => this.imageLoads.delete(k))
+      this.imageLoads.set(k, p)
+    }
+    return p
+  }
+
+  private async loadImage(m: Message, k: string): Promise<string> {
+    let blob = this.blobs.get(k)
+    if (!blob && m.seq) blob = (await imageDB.get(k).catch(() => undefined)) ?? undefined
+    if (!blob) {
+      if (!m.seq) throw new MediaError('error')
+      try {
+        const { url } = await api.media(m.conversation_id, m.seq)
+        const res = await fetch(url)
+        if (res.status === 404 || res.status === 403) throw new MediaError('expired')
+        if (!res.ok) throw new MediaError('error')
+        blob = await res.blob()
+      } catch (e) {
+        if (e instanceof MediaError) throw e
+        if (e instanceof ApiError && (e.status === 410 || e.status === 404)) throw new MediaError('expired')
+        console.warn('image download failed', e)
+        throw new MediaError('error')
+      }
+      imageDB.put(k, blob).catch((e) => console.warn('save image', e))
+    }
+    const u = URL.createObjectURL(blob)
+    this.blobUrls.set(k, u)
+    return u
+  }
+
+  // ---------- 语音转文字 ----------
+
+  private async loadTranscript(k: string) {
+    // 服务端关闭 STT 后仍显示以前转好的结果
+    if (this.state.transcripts[k]) return
+    try {
+      const text = await transcriptDB.get(k)
+      if (text && !this.state.transcripts[k]) this.set({ transcripts: { ...this.state.transcripts, [k]: { text } } })
+    } catch {}
+  }
+
+  async transcribe(m: Message) {
+    if (!m.seq || m.msg_type !== MSG_VOICE || m.recalled) return
+    const k = voiceKey(m.conversation_id, m.seq)
+    const cur = this.state.transcripts[k]
+    if (cur?.loading || cur?.text) return
+    this.set({ transcripts: { ...this.state.transcripts, [k]: { loading: true } } })
+    try {
+      const r = await api.transcribe(m.conversation_id, m.seq)
+      const text = (r.text ?? '').trim()
+      if (!text) {
+        this.showToast('没有识别到文字')
+        this.dropTranscript(k)
+        return
+      }
+      this.set({ transcripts: { ...this.state.transcripts, [k]: { text } } })
+      transcriptDB.put(k, text).catch(() => {})
+    } catch (e) {
+      this.dropTranscript(k)
+      let msg = '转文字失败，请稍后再试'
+      if (e instanceof ApiError) {
+        if (e.status === 429 || e.code === 'stt_limit') msg = '今日转文字次数已用完'
+        else if (e.status === 501 || e.code === 'stt_disabled') msg = '服务器未开启语音转文字'
+        else if (e.status === 410 || e.code === 'recalled') msg = '消息已撤回'
+        else if (e.status === 0) msg = '网络连接失败'
+        else if (e.status === 403 || e.status === 404) msg = e.message || '消息不存在'
+      }
+      this.showToast(msg)
+    }
+  }
+
+  private dropTranscript(k: string) {
+    const transcripts = { ...this.state.transcripts }
+    delete transcripts[k]
+    this.set({ transcripts })
   }
 }
 

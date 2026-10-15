@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { store, type State } from '../store'
 import { ApiError } from '../api'
 import { Icon } from '../icons'
-import { Avatar, ConvAvatar } from './Avatar'
+import { Avatar, ConvAvatar, OnlineDot } from './Avatar'
 import { useDialog } from './Dialogs'
 import { displayName, listTime } from '../util'
 import type { Member } from '../types'
@@ -151,7 +151,7 @@ export function GroupInfoDialog({ open, onClose, state, id }: { open: boolean; o
               const canRole = !isMe && myRole === 2
               return (
                 <li key={m.user.id} className="member-row">
-                  <Avatar user={m.user} size={36} />
+                  <OnlineDot online={!!state.config.presence_enabled && !!state.presence[m.user.id]?.online} size={36}><Avatar user={m.user} size={36} /></OnlineDot>
                   <div className="member-main">
                     <div>
                       {displayName(m.user)}

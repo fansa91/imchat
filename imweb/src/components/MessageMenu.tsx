@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { store } from '../store'
 import type { Message } from '../types'
-import { MSG_TEXT } from '../types'
+import { MSG_TEXT, MSG_VOICE } from '../types'
 import { Icon } from '../icons'
 
 /** 长按（手机，底部弹出）/ 悬停按钮、右键（桌面，气泡旁浮层）的消息菜单 */
@@ -101,6 +101,11 @@ export function MessageMenu({
               })}
             >
               <Icon name="copy" size={20} /> 复制
+            </button>
+          )}
+          {m.msg_type === MSG_VOICE && m.seq > 0 && store.get().config.stt_enabled && !store.get().transcripts[`${m.conversation_id}:${m.seq}`] && (
+            <button role="menuitem" onClick={act(() => store.transcribe(m))}>
+              <Icon name="subtitles" size={20} /> 转文字
             </button>
           )}
           {store.canRecall(m) && (

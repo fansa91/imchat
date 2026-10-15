@@ -1,4 +1,7 @@
-# imweb v0.2.0
+# imweb v0.3.0
+
+**v0.3.0 新增**：图片消息（选择 / 粘贴 / 拖入，本地压缩到长边 2048 JPEG 0.85，GIF 原样；全屏查看与保存；IndexedDB 永久缓存）、在线状态（单聊“在线 / 最后在线”、头像绿点、群聊“N 人在线”）、语音转文字（右键 / 长按“转文字”，结果本地缓存）。服务端 `/api/config` 没有 `image_enabled` / `presence_enabled` / `stt_enabled` 时自动隐藏对应功能；未知消息类型显示“[不支持的消息，请升级]”。
+
 
 imserver 的 Web 客户端：React 19 + TypeScript + Vite + Material Web（Material You 3），桌面双栏、手机单栏自适应。
 

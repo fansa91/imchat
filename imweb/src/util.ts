@@ -78,8 +78,22 @@ export function systemText(m: Message, meId?: number) {
 export function previewOf(m: Message, meId: number | undefined, senderName: (id: number) => string) {
   if (m.recalled) return `${m.sender_id === meId ? '你' : senderName(m.sender_id)}撤回了一条消息`
   if (m.msg_type === 10) return systemText(m, meId)
-  if (m.msg_type === 1) return m.content
-  if (m.msg_type === 3) return '[语音]'
-  if (m.msg_type === 2) return '[图片]'
-  return '[消息]'
+  return shortPreview(m.msg_type, m.content)
+}
+
+export const UNSUPPORTED = '[不支持的消息，请升级]'
+
+/** 引用条 / 回复栏 / 会话列表里按类型显示的简短内容 */
+export function shortPreview(msgType: number, content: string) {
+  if (msgType === 1) return content
+  if (msgType === 2) return '[图片]'
+  if (msgType === 3) return '[语音]'
+  return UNSUPPORTED
+}
+
+/** 在线状态文字：“在线” / “最后在线 今天 14:03” */
+export function presenceText(p?: { online: boolean; last_seen: string | null }) {
+  if (!p) return ''
+  if (p.online) return '在线'
+  return p.last_seen ? `最后在线 ${dayLabel(p.last_seen)}` : '离线'
 }

@@ -1,11 +1,12 @@
 import { memo, useRef } from 'react'
-import { store, type VoiceState } from '../store'
+import { store, type Transcript, type VoiceState } from '../store'
 import type { Message, Reaction } from '../types'
-import { MSG_SYSTEM, MSG_TEXT, MSG_VOICE } from '../types'
+import { MSG_IMAGE, MSG_SYSTEM, MSG_TEXT, MSG_VOICE } from '../types'
 import { Avatar } from './Avatar'
 import { VoiceBubble } from './VoiceBubble'
+import { ImageBubble } from './ImageBubble'
 import { Icon } from '../icons'
-import { hm, systemText } from '../util'
+import { hm, shortPreview, systemText, UNSUPPORTED } from '../util'
 
 export interface ItemProps {
   m: Message
@@ -18,6 +19,7 @@ export interface ItemProps {
   replyName: string
   replyOrig?: Message
   voiceState?: VoiceState
+  transcript?: Transcript
   highlighted: boolean
   onMenu: (m: Message, rect: DOMRect) => void
   onJump: (seq: number) => void
@@ -74,13 +76,8 @@ export const MessageItem = memo(function MessageItem(p: ItemProps) {
 
   const reply = m.reply_to
   const origRecalled = p.replyOrig ? !!p.replyOrig.recalled : !!reply?.recalled
-  const origPreview = p.replyOrig
-    ? p.replyOrig.msg_type === MSG_TEXT
-      ? p.replyOrig.content
-      : p.replyOrig.msg_type === MSG_VOICE
-        ? '[语音]'
-        : '[消息]'
-    : reply?.preview
+  const origPreview = p.replyOrig ? shortPreview(p.replyOrig.msg_type, p.replyOrig.content) : reply?.preview
+  const isImage = m.msg_type === MSG_IMAGE
 
   return (
     <div
@@ -99,7 +96,7 @@ export const MessageItem = memo(function MessageItem(p: ItemProps) {
           )}
           <div
             ref={bubbleRef}
-            className={'bubble' + (m.status === 'sending' ? ' sending' : '') + (m.msg_type === MSG_VOICE ? ' voice' : '')}
+            className={'bubble' + (m.status === 'sending' ? ' sending' : '') + (m.msg_type === MSG_VOICE ? ' voice' : '') + (isImage ? ' image' : '') + (isImage && reply ? ' with-quote' : '')}
             title={hm(m.created_at)}
             onContextMenu={(e) => {
               e.preventDefault()
@@ -116,7 +113,15 @@ export const MessageItem = memo(function MessageItem(p: ItemProps) {
                 <span className="quote-text">{reply.missing ? '原消息不可见' : origRecalled ? '原消息已撤回' : origPreview}</span>
               </button>
             )}
-            {m.msg_type === MSG_VOICE ? <VoiceBubble m={m} state={p.voiceState} /> : m.msg_type === MSG_TEXT ? m.content : '[暂不支持的消息类型]'}
+            {m.msg_type === MSG_VOICE ? (
+              <VoiceBubble m={m} state={p.voiceState} />
+            ) : isImage ? (
+              <ImageBubble m={m} />
+            ) : m.msg_type === MSG_TEXT ? (
+              m.content
+            ) : (
+              <span className="unsupported">{UNSUPPORTED}</span>
+            )}
           </div>
           {m.seq > 0 && (
             <div className="hover-tools">
@@ -129,6 +134,7 @@ export const MessageItem = memo(function MessageItem(p: ItemProps) {
             </div>
           )}
         </div>
+        {m.msg_type === MSG_VOICE && p.transcript && <TranscriptBlock t={p.transcript} />}
         {!!m.reactions?.length && <Reactions m={m} list={m.reactions} meId={meId} />}
       </div>
     </div>
@@ -149,6 +155,37 @@ function Reactions({ m, list, meId }: { m: Message; list: Reaction[]; meId: numb
           {r.count > 1 && <span className="chip-n">{r.count}</span>}
         </button>
       ))}
+    </div>
+  )
+}
+
+/** 语音转文字结果：语音气泡下方的小文字块，可选中 / 一键复制 */
+function TranscriptBlock({ t }: { t: Transcript }) {
+  if (t.loading) {
+    return (
+      <div className="transcript loading" aria-live="polite">
+        <md-circular-progress indeterminate style={{ '--md-circular-progress-size': '16px' } as any} />
+        转写中…
+      </div>
+    )
+  }
+  if (!t.text) return null
+  return (
+    <div className="transcript">
+      <span className="transcript-text">{t.text}</span>
+      <button
+        className="transcript-copy"
+        aria-label="复制文字"
+        title="复制"
+        onClick={() =>
+          navigator.clipboard?.writeText(t.text!).then(
+            () => store.showToast('已复制'),
+            () => store.showToast('复制失败'),
+          )
+        }
+      >
+        <Icon name="copy" size={16} />
+      </button>
     </div>
   )
 }
