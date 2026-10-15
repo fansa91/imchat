@@ -1,4 +1,4 @@
-# imserver v0.2.0
+# imserver v0.3.0
 
 类 iMessage 聊天服务端：Go + MySQL + Redis + WebSocket，语音文件存放在 S3 兼容存储（推荐 Garage）。
 
@@ -11,13 +11,20 @@
 - **引用回复 / 表情回应**：`reply_to_seq` 引用（预览实时计算，原消息撤回后显示已撤回）；iMessage 风格表情回应（❤️👍👎😂‼️❓ 或任意 emoji），可切换，聚合计数，实时同步。
 - **语音消息**：客户端通过服务端签发的预签名 PUT 直传到 S3 存储，发送时服务端校验大小/类型/文件头；服务器只保留 7 天（启动时自动设置 bucket 生命周期规则 + CORS），客户端收到后永久保存在本地。
 
-升级步骤见 [UPGRADE-v0.2.0.md](../docs/UPGRADE-v0.2.0.md)。
+**v0.3.0 新增**（接口约定见 [SPEC-v0.3.0.md](../docs/SPEC-v0.3.0.md)）：
+
+- **图片消息**：与语音同一条预签名直传链路（`kind:"image"`，JPEG/PNG/WebP/GIF，默认 ≤10MB），发送时服务端校验 key 归属、大小与文件头；默认永久保存（`storage.image_ttl_days: 0`）；撤回时删除对象。
+- **在线状态**：任意一个 WS 连接即在线（多设备/多实例，Redis 计数），状态翻转时向共享会话的成员推送 `presence` 事件；`GET /api/presence` 批量查询；`users.last_seen_at` 记录最后在线时间。
+- **语音转文字**：`POST .../messages/{seq}/transcribe`，Groq / Cloudflare Workers AI（主备），结果缓存在 `message_transcripts`，每用户每日限额；默认关闭。
+
+v0.2.0 → v0.3.0 直接替换二进制重启即可：启动时自动迁移（新增 `message_transcripts` 表和 `users.last_seen_at` 列，可重复执行），旧配置文件无需修改。
+v0.1.0 → v0.2.0 的升级步骤见 [UPGRADE-v0.2.0.md](../docs/UPGRADE-v0.2.0.md)。
 
 ## 目录
 
 ```
 cmd/server        主程序
-cmd/smoketest     端到端冒烟测试（v0.1 + v0.2 共 79 项）
+cmd/smoketest     端到端冒烟测试（v0.1 + v0.2 + v0.3 共 127 项）
 internal/config   YAML 配置加载
 internal/store    MySQL 数据访问 + 建表/升级脚本（migrations/ + upgradeColumns）
 internal/auth     bcrypt 密码 + JWT
@@ -64,12 +71,18 @@ journalctl -u imserver -f
 ```bash
 make all          # bin/imserver-linux-arm64 和 bin/imserver-linux-amd64
 # 没有 make 时：
-for a in arm64 amd64; do CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w -X main.version=v0.2.0" -o bin/imserver-linux-$a ./cmd/server; done
+for a in arm64 amd64; do CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w -X main.version=v0.3.0" -o bin/imserver-linux-$a ./cmd/server; done
 
-# 冒烟测试（服务运行在 8092；带 -s3-* 参数时包含语音/生命周期/CORS 检查）
+# 冒烟测试（服务运行在 8092；带 -s3-* 参数时包含语音/图片/生命周期/CORS 检查）
 go run ./cmd/smoketest -base http://127.0.0.1:8092 \
   -s3-endpoint 127.0.0.1:3900 -s3-key GK... -s3-secret ... -bucket imchat -s3-region garage \
   -origin https://im.fansa.ccwu.cc
+# v0.3：再加 -stt-base 指向第二个实例（同库同 Redis，node_id 不同），其配置开启 stt 并把
+#   stt.groq.base_url: http://127.0.0.1:18099/openai/v1
+#   stt.cloudflare.base_url: http://127.0.0.1:18099/client/v4
+#   stt.daily_limit_per_user: 2，groq.api_key: test-groq-key，cloudflare.account_id/api_token: test-account/test-cf-token
+# 冒烟测试会在 -stt-stub（默认 127.0.0.1:18099）启动假提供方；同时验证在线状态跨实例推送。
+#   go run ./cmd/smoketest ... -stt-base http://127.0.0.1:8093
 ```
 
 ## 配置
@@ -94,6 +107,20 @@ go run ./cmd/smoketest -base http://127.0.0.1:8092 \
 | `storage.verify_upload` | true | 发送语音时检查对象（Stat + 读文件头 16 字节，共 2 次请求）；关闭则只做 key 归属/类型/时长/声明大小校验 |
 | `storage.presign_put_seconds` / `presign_get_seconds` | 300 / 300 | 预签名有效期 |
 | `storage.enabled` | 自动 | 可省略；显式 `false` 关闭语音 |
+
+v0.3.0 新增：
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `storage.image_max_bytes` | 10485760 | 单张图片最大字节数 |
+| `storage.image_ttl_days` | 0 | 服务器保留图片天数；0 = 永久（不加生命周期规则；>0 时加 `image/` 前缀规则） |
+| `stt.enabled` | false | 语音转文字总开关（需要对象存储） |
+| `stt.provider` / `stt.fallback` | groq / 空 | `groq` 或 `cloudflare`；主提供方 5xx/超时/429/网络错误时尝试 fallback（fallback 未填凭据则忽略） |
+| `stt.language` | zh | 留空自动识别 |
+| `stt.daily_limit_per_user` | 50 | 每用户每天（Asia/Shanghai 日界）次数，0 不限；缓存命中不计次，失败退回 |
+| `stt.timeout_seconds` | 30 | 单次请求提供方超时 |
+| `stt.groq.api_key` / `model` / `base_url` | — / whisper-large-v3-turbo / `https://api.groq.com/openai/v1` | |
+| `stt.cloudflare.account_id` / `api_token` / `model` / `base_url` | — / — / `@cf/openai/whisper-large-v3-turbo` / `https://api.cloudflare.com/client/v4` | |
 
 服务端访问存储的请求很少：启动时 1 次 HeadBucket + 生命周期/CORS 设置；每条语音发送时 2 次（可关）；撤回语音时 1 次删除。生成预签名 URL 和下载接口都不访问存储（下载接口按消息时间判断是否超过 `voice_ttl_days`）。
 
@@ -132,6 +159,16 @@ go run ./cmd/smoketest -base http://127.0.0.1:8092 \
 | POST | /api/uploads/presign | 申请上传 `{kind:"voice", mime, size, duration_ms}` → `{key, url, method:"PUT", headers, expires_at, max_bytes}`；客户端用返回的 `headers` 直接 PUT 到 `url` |
 | GET | /api/conversations/{id}/messages/{seq}/media | 媒体下载地址 → `{url, mime, size, expires_at}`（预签名 GET，默认 5 分钟）；已撤回 410 `recalled`；超过保留期 410 `expired` |
 
+### v0.3.0 新增
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/config | 新增 `image_enabled`（存储已配置）、`image_max_bytes`、`image_ttl_days`（存储已配置时）、`presence_enabled: true`、`stt_enabled` |
+| POST | /api/uploads/presign | `{kind:"image", mime, size, width?, height?}`；mime 仅 `image/jpeg\|png\|webp\|gif`（否则 400 `bad_mime`），`size ≤ image_max_bytes`（否则 400 `too_large`）；响应与 voice 相同，key 前缀 `image/` |
+| GET | /api/conversations/{id}/messages/{seq}/media | 图片同样适用 → `{url, mime, size, expires_at}`；`image_ttl_days>0` 且超期 410 `expired` |
+| GET | /api/presence?ids=1,2,3 | 最多 200 个（超出 400 `too_many`）→ `[{"user_id":1,"online":true,"last_seen":null}, ...]`；只返回与请求者共享会话的用户（去重、按请求顺序）；`last_seen` 为 RFC3339 UTC，在线或从未离线为 `null` |
+| POST | /api/conversations/{id}/messages/{seq}/transcribe | → `{"text":"...","cached":false}`；未启用 501 `stt_disabled`；非成员 403；非语音 404 `not_voice`；不存在 404；已撤回 410 `recalled`；语音已过期 410 `expired`；超限 429 `stt_limit`；提供方失败 502 `stt_failed` |
+
 **会话对象**（`/api/conversations` 列表项）：
 
 ```
@@ -149,11 +186,12 @@ reply_to_seq?, reply_to?{seq, sender_id, msg_type, preview, recalled, missing?},
 recalled?, recalled_at?, mod_seq?, reactions?[{emoji, count, user_ids[]}]
 ```
 
-`msg_type`：1 文本，2 图片（预留），3 语音，4 视频（预留），5 文件（预留），10 系统消息。
+`msg_type`：1 文本，2 图片，3 语音，4 视频（预留），5 文件（预留），10 系统消息。
 
 - 语音 `content`（JSON 字符串）：`{"key":"voice/{uid}/{yyyymm}/{hex}.webm","mime":"audio/webm","duration_ms":3200,"size":12345,"waveform":[0~100 最多 64 个]}`
+- 图片 `content`（JSON 字符串，v0.3）：`{"key":"image/{uid}/{yyyymm}/{hex}.jpg","mime":"image/jpeg","size":12345,"width":1024,"height":768}`（width/height 必填 >0；预览文字 `[图片]`）
 - 系统消息 `content`（JSON 字符串）：`{"op":"create|join|leave|remove|rename|announce|role","actor":{id,nickname},"targets":[{id,nickname}],"name":"新群名","value":"公告内容/admin|member","text":"可直接显示的中文"}`
-- 撤回后 `recalled=true`、`content` 清空、表情回应清空；语音文件同时从存储删除。
+- 撤回后 `recalled=true`、`content` 清空、表情回应清空；语音/图片文件同时从存储删除，语音的转文字结果一并删除。
 
 ## WebSocket 协议
 
@@ -189,6 +227,7 @@ recalled?, recalled_at?, mod_seq?, reactions?[{emoji, count, user_ids[]}]
 | conversation_updated | `{conversation_id, reason}` | **v0.2** 群信息/成员变化，客户端调 `GET /api/conversations/{id}` 刷新 |
 | conversation_removed | `{conversation_id, reason: left\|removed}` | **v0.2** 自己已不在该会话 |
 | ack | `{op: recall\|react\|delete, ...}` | **v0.2** 对带 `id` 的 recall/react/delete 请求的回执 |
+| presence | `{user_id, online, last_seen}` | **v0.3** 共享会话成员上线/离线，仅在第一个连接建立/最后一个连接断开时推送；`last_seen` 上线时为 `null`，离线时为 RFC3339 UTC |
 | pong / error | `{}` / `{code, message}` | |
 
 常见错误码：`forbidden`（不是成员/无权限）、`recall_expired`、`already_recalled`、`not_found`、`too_many`、`unsupported`（未启用存储）、`rate_limited`。
@@ -210,6 +249,5 @@ recalled?, recalled_at?, mod_seq?, reactions?[{emoji, count, user_ids[]}]
 
 ## 下一步
 
-- 图片消息（上传链路已按 `kind` 设计，增加 `image` 类型即可）
 - 接入 APNs / FCM（实现 `internal/push.Notifier`）
 - 端到端加密

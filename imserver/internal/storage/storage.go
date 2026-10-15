@@ -6,7 +6,7 @@
 //  2. 客户端直接 PUT 文件到对象存储
 //  3. 客户端发送消息时带上 key，服务端 StatObject + 读取文件头校验真实大小和类型，通过后才落库
 //
-// key 格式：{kind}/{uid}/{yyyymm}/{32位随机hex}.{ext}，kind 目前只有 voice，后续可加 image。
+// key 格式：{kind}/{uid}/{yyyymm}/{32位随机hex}.{ext}，kind 为 voice 或 image（v0.3.0）。
 // key 中带上传者 uid，发送消息时校验只能引用自己上传的文件。
 package storage
 
@@ -39,7 +39,10 @@ var (
 )
 
 // LifecycleRuleID 自动设置的生命周期规则 ID。
-const LifecycleRuleID = "imserver-voice-expire"
+const (
+	LifecycleRuleID      = "imserver-voice-expire"
+	ImageLifecycleRuleID = "imserver-image-expire" // 仅 image_ttl_days > 0 时设置
+)
 
 type Storage struct {
 	cfg     config.StorageConfig
@@ -91,7 +94,7 @@ func New(ctx context.Context, cfg config.StorageConfig) (*Storage, error) {
 			slog.Warn("⚠️ 无法自动设置 bucket 生命周期规则（语音不会自动过期！）。请确认 access key 有 owner 权限（garage bucket allow --owner），或手动设置 voice/ 前缀 "+
 				fmt.Sprint(cfg.VoiceTTLDays)+" 天过期", "bucket", cfg.Bucket, "err", err)
 		} else {
-			slog.Info("storage lifecycle ensured", "bucket", cfg.Bucket, "prefix", "voice/", "expire_days", cfg.VoiceTTLDays)
+			slog.Info("storage lifecycle ensured", "bucket", cfg.Bucket, "voice_expire_days", cfg.VoiceTTLDays, "image_expire_days", cfg.ImageTTLDays)
 		}
 		if err := s.EnsureCORS(cctx); err != nil {
 			slog.Warn("⚠️ 无法自动设置 bucket CORS（浏览器直传/下载会被拦截）。请确认 access key 有 owner 权限，或在存储/反向代理上手动配置 CORS",
@@ -105,7 +108,8 @@ func New(ctx context.Context, cfg config.StorageConfig) (*Storage, error) {
 
 func (s *Storage) Config() config.StorageConfig { return s.cfg }
 
-// EnsureLifecycle 给 voice/ 前缀设置 N 天过期规则；保留 bucket 上已有的其他规则。
+// EnsureLifecycle 给 voice/ 前缀设置 N 天过期规则；image_ttl_days > 0 时给 image/ 前缀设置规则，
+// 为 0（永久）时删除之前可能设置过的图片规则。保留 bucket 上已有的其他规则。
 func (s *Storage) EnsureLifecycle(ctx context.Context) error {
 	conf, err := s.cli.GetBucketLifecycle(ctx, s.cfg.Bucket)
 	if err != nil {
@@ -117,18 +121,42 @@ func (s *Storage) EnsureLifecycle(ctx context.Context) error {
 	if conf == nil {
 		conf = lifecycle.NewConfiguration()
 	}
-	want := lifecycle.Rule{
+	want := []lifecycle.Rule{{
 		ID:         LifecycleRuleID,
 		Status:     "Enabled",
 		RuleFilter: lifecycle.Filter{Prefix: "voice/"},
 		Expiration: lifecycle.Expiration{Days: lifecycle.ExpirationDays(s.cfg.VoiceTTLDays)},
+	}}
+	if s.cfg.ImageTTLDays > 0 {
+		want = append(want, lifecycle.Rule{
+			ID:         ImageLifecycleRuleID,
+			Status:     "Enabled",
+			RuleFilter: lifecycle.Filter{Prefix: "image/"},
+			Expiration: lifecycle.Expiration{Days: lifecycle.ExpirationDays(s.cfg.ImageTTLDays)},
+		})
 	}
-	rules := []lifecycle.Rule{want}
+	same := func(a, b lifecycle.Rule) bool {
+		return a.Status == b.Status && a.Expiration.Days == b.Expiration.Days && a.RuleFilter.Prefix == b.RuleFilter.Prefix
+	}
+	// 已是期望状态则不写
+	existing := map[string]lifecycle.Rule{}
 	for _, r := range conf.Rules {
-		if r.ID == LifecycleRuleID {
-			if r.Status == "Enabled" && int(r.Expiration.Days) == s.cfg.VoiceTTLDays && r.RuleFilter.Prefix == "voice/" {
-				return nil // 已是期望状态
-			}
+		if r.ID == LifecycleRuleID || r.ID == ImageLifecycleRuleID {
+			existing[r.ID] = r
+		}
+	}
+	upToDate := len(existing) == len(want)
+	for _, w := range want {
+		if r, ok := existing[w.ID]; !ok || !same(r, w) {
+			upToDate = false
+		}
+	}
+	if upToDate {
+		return nil
+	}
+	rules := want
+	for _, r := range conf.Rules {
+		if r.ID == LifecycleRuleID || r.ID == ImageLifecycleRuleID {
 			continue
 		}
 		rules = append(rules, r)
@@ -230,6 +258,42 @@ func sniffAudio(h []byte) string {
 	return ""
 }
 
+// ---------- 图片类型（v0.3.0） ----------
+
+// imageMimes 允许的图片 MIME → 扩展名。
+var imageMimes = map[string]string{
+	"image/jpeg": "jpg",
+	"image/png":  "png",
+	"image/webp": "webp",
+	"image/gif":  "gif",
+}
+
+// NormalizeImageMime 校验图片 MIME（image/jpg 视为 image/jpeg），返回基础 MIME 和扩展名。
+func NormalizeImageMime(m string) (mime, ext string, ok bool) {
+	m = strings.ToLower(strings.TrimSpace(strings.SplitN(m, ";", 2)[0]))
+	if m == "image/jpg" || m == "image/pjpeg" {
+		m = "image/jpeg"
+	}
+	ext, ok = imageMimes[m]
+	return m, ext, ok
+}
+
+// sniffImage 根据文件头判断真实图片格式。
+func sniffImage(h []byte) string {
+	has := func(off int, sig string) bool { return len(h) >= off+len(sig) && string(h[off:off+len(sig)]) == sig }
+	switch {
+	case has(0, "\xff\xd8\xff"):
+		return "image/jpeg"
+	case has(0, "\x89PNG\r\n\x1a\n"):
+		return "image/png"
+	case has(0, "RIFF") && has(8, "WEBP"):
+		return "image/webp"
+	case has(0, "GIF87a"), has(0, "GIF89a"):
+		return "image/gif"
+	}
+	return ""
+}
+
 // ---------- 预签名 ----------
 
 func (s *Storage) PresignPut(ctx context.Context, key string) (string, time.Time, error) {
@@ -312,9 +376,67 @@ func (s *Storage) VerifyVoice(ctx context.Context, key, declaredMime string) (*O
 	return &ObjectInfo{Size: st.Size, Mime: real}, nil
 }
 
+// VerifyImage 校验已上传的图片对象：存在、大小不超限、文件头是允许的图片格式且与声明一致。
+// 不合格的对象会被删除。
+func (s *Storage) VerifyImage(ctx context.Context, key, declaredMime string) (*ObjectInfo, error) {
+	st, err := s.cli.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		if r := minio.ToErrorResponse(err); r.Code == "NoSuchKey" || r.StatusCode == http.StatusNotFound {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	reject := func(msg string) (*ObjectInfo, error) {
+		_ = s.cli.RemoveObject(context.Background(), s.cfg.Bucket, key, minio.RemoveObjectOptions{})
+		return nil, errors.New(msg)
+	}
+	if st.Size <= 0 || st.Size > s.cfg.ImageMaxBytes {
+		return reject(fmt.Sprintf("图片大小超出限制（最大 %d MB）", s.cfg.ImageMaxBytes>>20))
+	}
+	opts := minio.GetObjectOptions{}
+	_ = opts.SetRange(0, 15)
+	obj, err := s.cli.GetObject(ctx, s.cfg.Bucket, key, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer obj.Close()
+	head, err := io.ReadAll(io.LimitReader(obj, 16))
+	if err != nil {
+		return nil, err
+	}
+	real := sniffImage(head)
+	if real == "" {
+		return reject("不是有效的图片文件")
+	}
+	if decl, _, _ := NormalizeImageMime(declaredMime); decl != real {
+		return reject("图片格式与声明不符")
+	}
+	return &ObjectInfo{Size: st.Size, Mime: real}, nil
+}
+
+// Read 读取整个对象（语音转文字用），超过 maxBytes 报错。对象不存在返回 ErrNotFound。
+func (s *Storage) Read(ctx context.Context, key string, maxBytes int64) ([]byte, error) {
+	obj, err := s.cli.GetObject(ctx, s.cfg.Bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer obj.Close()
+	b, err := io.ReadAll(io.LimitReader(obj, maxBytes+1))
+	if err != nil {
+		if r := minio.ToErrorResponse(err); r.Code == "NoSuchKey" || r.StatusCode == http.StatusNotFound {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf("对象超过 %d 字节", maxBytes)
+	}
+	return b, nil
+}
+
 func isAAC(m string) bool { return m == "audio/mp4" || m == "audio/aac" }
 
-// Remove 删除对象（撤回语音时调用），忽略不存在。
+// Remove 删除对象（撤回语音/图片时调用），忽略不存在。
 func (s *Storage) Remove(ctx context.Context, key string) error {
 	return s.cli.RemoveObject(ctx, s.cfg.Bucket, key, minio.RemoveObjectOptions{})
 }

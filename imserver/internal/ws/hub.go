@@ -37,7 +37,24 @@ func onlineKey(uid uint64) string { return "im:online:" + strconv.FormatUint(uid
 
 const presenceTTL = 90 * time.Second
 
-func (h *Hub) register(c *Client) {
+// presenceAdd 原子地：清掉过期连接 → 加入本连接 → 返回加入前的有效连接数。
+// 返回 0 表示用户刚从离线变为在线（跨实例正确：所有实例共用同一个 ZSET）。
+var presenceAdd = redis.NewScript(`
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+local before = redis.call('ZCARD', KEYS[1])
+if redis.call('ZSCORE', KEYS[1], ARGV[3]) then before = before - 1 end
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+return before`)
+
+// presenceDel 原子地：移除本连接 → 清掉过期连接 → 返回 {是否移除了, 剩余有效连接数}。
+var presenceDel = redis.NewScript(`
+local removed = redis.call('ZREM', KEYS[1], ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+return {removed, redis.call('ZCARD', KEYS[1])}`)
+
+// register 登记连接，返回该用户是否刚变为在线（第一个连接）。
+func (h *Hub) register(c *Client) (becameOnline bool) {
 	h.mu.Lock()
 	set, ok := h.conns[c.userID]
 	if !ok {
@@ -46,10 +63,20 @@ func (h *Hub) register(c *Client) {
 	}
 	set[c] = struct{}{}
 	h.mu.Unlock()
-	h.touchPresence(context.Background(), c)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	now := time.Now()
+	n, err := presenceAdd.Run(ctx, h.rdb, []string{onlineKey(c.userID)},
+		now.Unix(), now.Add(presenceTTL).Unix(), c.connID, int(presenceTTL/time.Second)).Int64()
+	if err != nil {
+		slog.Warn("presence register failed", "err", err)
+		return false
+	}
+	return n == 0
 }
 
-func (h *Hub) unregister(c *Client) {
+// unregister 注销连接，返回该用户是否刚变为离线（最后一个连接断开）。
+func (h *Hub) unregister(c *Client) (becameOffline bool) {
 	h.mu.Lock()
 	if set, ok := h.conns[c.userID]; ok {
 		delete(set, c)
@@ -60,7 +87,12 @@ func (h *Hub) unregister(c *Client) {
 	h.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	h.rdb.ZRem(ctx, onlineKey(c.userID), c.connID)
+	res, err := presenceDel.Run(ctx, h.rdb, []string{onlineKey(c.userID)}, time.Now().Unix(), c.connID).Int64Slice()
+	if err != nil || len(res) != 2 {
+		slog.Warn("presence unregister failed", "err", err)
+		return false
+	}
+	return res[0] == 1 && res[1] == 0
 }
 
 // touchPresence 记录连接在线，score 为过期时间戳；用 ZSET 支持多设备同时在线。
@@ -74,6 +106,27 @@ func (h *Hub) touchPresence(ctx context.Context, c *Client) {
 	if _, err := pipe.Exec(ctx); err != nil {
 		slog.Warn("presence update failed", "err", err)
 	}
+}
+
+// OnlineMany 批量判断用户是否在线（跨节点）。
+func (h *Hub) OnlineMany(ctx context.Context, uids []uint64) (map[uint64]bool, error) {
+	out := make(map[uint64]bool, len(uids))
+	if len(uids) == 0 {
+		return out, nil
+	}
+	now := strconv.FormatInt(time.Now().Unix(), 10)
+	pipe := h.rdb.Pipeline()
+	cmds := make([]*redis.IntCmd, len(uids))
+	for i, uid := range uids {
+		cmds[i] = pipe.ZCount(ctx, onlineKey(uid), now, "+inf")
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+	for i, uid := range uids {
+		out[uid] = cmds[i].Val() > 0
+	}
+	return out, nil
 }
 
 // IsOnline 判断用户是否有任一设备在线（跨节点）。

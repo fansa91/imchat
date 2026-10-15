@@ -1,4 +1,5 @@
-# imserver 配置文件（v0.2.0）
+# imserver 配置文件（v0.3.0）
+# 所有 v0.3.0 新增键都有默认值，v0.2.0 的配置文件不改也能启动（图片默认开启、语音转文字默认关闭）。
 # 启动: ./imserver -c config.yaml
 
 server:
@@ -34,8 +35,8 @@ group:
 message:
   recall_seconds: 120      # 发送后多少秒内可以撤回
 
-# S3 兼容存储（推荐 Garage；MinIO 等其他 S3 也可用）。用于语音消息，后续图片也走这里。
-# 不需要语音时整段删掉（或 enabled: false）即可，其他功能不受影响。
+# S3 兼容存储（推荐 Garage；MinIO 等其他 S3 也可用）。用于语音和图片消息。
+# 不需要语音/图片时整段删掉（或 enabled: false）即可，其他功能不受影响。
 storage:
   # 服务端访问存储的地址（host:port，不带 http://）。
   #   存储在另一台机器（另一个地域）：填公网 HTTPS 域名，如 "s3.fansa.ccwu.cc:443" + use_ssl: true
@@ -55,9 +56,31 @@ storage:
   voice_max_seconds: 60    # 单条语音最长秒数
   voice_max_bytes: 2097152 # 单条语音最大字节数（2MB）
   set_lifecycle: true      # 启动时自动设置生命周期 + CORS（access key 需要 owner 权限）
-  verify_upload: true      # 发送语音时服务端检查对象大小与文件头（每条 2 次请求）；跨地域嫌慢可改 false
+  verify_upload: true      # 发送语音/图片时服务端检查对象大小与文件头（每条 2 次请求）；跨地域嫌慢可改 false
   presign_put_seconds: 300 # 上传链接有效期
   presign_get_seconds: 300 # 下载链接有效期
+  # ---------- v0.3.0 新增 ----------
+  image_max_bytes: 10485760 # 单张图片最大字节数（10MB）；只允许 JPEG / PNG / WebP / GIF
+  image_ttl_days: 0         # 服务器保留图片的天数；0 = 永久保存（不加生命周期规则）
+
+# ---------- v0.3.0 新增：语音转文字 ----------
+# 默认关闭。开启需要对象存储（服务端从存储读取语音再送给提供方）。
+stt:
+  enabled: false
+  provider: groq            # groq | cloudflare
+  fallback: cloudflare      # 可留空；主提供方失败（5xx/超时/429）时尝试（未填凭据则忽略）
+  language: zh              # 可留空让模型自动识别
+  daily_limit_per_user: 50  # 每用户每天次数（Asia/Shanghai 日界），0 = 不限；已缓存的结果不计次
+  timeout_seconds: 30       # 单次请求提供方的超时
+  groq:
+    api_key: ""             # https://console.groq.com/keys
+    model: whisper-large-v3-turbo
+    # base_url: "https://api.groq.com/openai/v1"        # 默认值；测试/代理时可改
+  cloudflare:
+    account_id: ""
+    api_token: ""           # 需要 Workers AI 权限
+    model: "@cf/openai/whisper-large-v3-turbo"
+    # base_url: "https://api.cloudflare.com/client/v4"  # 默认值；测试/代理时可改
 
 log:
   level: "info"            # debug | info | warn | error

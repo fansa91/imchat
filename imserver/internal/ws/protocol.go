@@ -25,6 +25,7 @@ import "encoding/json"
 //	deleted   {conversation_id, seqs}     自己（任一设备）删除了这些消息
 //	conversation_updated {conversation_id, reason}  群信息/成员变化，客户端刷新会话
 //	conversation_removed {conversation_id, reason}  自己已不在该会话（退群/被移出）
+//	presence  {user_id, online, last_seen}  v0.3.0：共享会话成员上线/离线（仅状态翻转时推送）
 //	ack       {op, ...}                   recall/react/delete 的请求回执（带请求 id）
 //	pong      {}
 //	error     {code, message}
@@ -75,6 +76,28 @@ type VoiceContent struct {
 	DurationMs int    `json:"duration_ms"`
 	Size       int64  `json:"size"`
 	Waveform   []int  `json:"waveform,omitempty"` // 可选：最多 64 个 0~100 的振幅，用于绘制波形
+}
+
+// ImageContent 图片消息（msg_type=2）的 content（v0.3.0）。
+type ImageContent struct {
+	Key    string `json:"key"`
+	Mime   string `json:"mime"`
+	Size   int64  `json:"size"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+// MediaKey 从语音/图片消息 content 中取对象 key 和 MIME（两者字段名相同）。
+func MediaKey(content string) (key, mime string, size int64) {
+	var v struct {
+		Key  string `json:"key"`
+		Mime string `json:"mime"`
+		Size int64  `json:"size"`
+	}
+	if json.Unmarshal([]byte(content), &v) != nil {
+		return "", "", 0
+	}
+	return v.Key, v.Mime, v.Size
 }
 
 type errorData struct {

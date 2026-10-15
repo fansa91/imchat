@@ -79,11 +79,54 @@ func (c *Client) closeOnce() { c.once.Do(func() { close(c.done) }) }
 
 // Serve 启动读写循环，阻塞直到连接关闭。
 func (c *Client) Serve() {
-	c.hub.register(c)
-	defer c.hub.unregister(c)
+	if c.hub.register(c) {
+		c.publishPresence(true)
+	}
+	defer func() {
+		if c.hub.unregister(c) {
+			c.publishPresence(false)
+		}
+	}()
 	go c.writeLoop()
 	c.readLoop()
 	c.closeOnce()
+}
+
+// PresenceData 在线状态（WS presence 事件 data 与 GET /api/presence 的元素同结构）。
+// last_seen 为 RFC3339（UTC）；在线或从未断开过为 null。
+type PresenceData struct {
+	UserID   uint64  `json:"user_id"`
+	Online   bool    `json:"online"`
+	LastSeen *string `json:"last_seen"`
+}
+
+// FormatLastSeen 把时间格式化为 presence 用的 RFC3339 字符串。
+func FormatLastSeen(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := t.UTC().Format(time.RFC3339)
+	return &s
+}
+
+// publishPresence 在线状态翻转时（第一个连接建立 / 最后一个连接断开）推给共享会话的成员。
+func (c *Client) publishPresence(online bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	data := PresenceData{UserID: c.userID, Online: online}
+	if !online {
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		if err := c.store.SetLastSeen(ctx, c.userID, now); err != nil {
+			slog.Warn("set last_seen failed", "user", c.userID, "err", err)
+		}
+		data.LastSeen = FormatLastSeen(&now)
+	}
+	targets, err := c.store.CoMembers(ctx, c.userID)
+	if err != nil {
+		slog.Warn("presence co-members failed", "user", c.userID, "err", err)
+		return
+	}
+	c.hub.Publish(ctx, targets, "", encode("presence", "", data))
 }
 
 func (c *Client) readLoop() {

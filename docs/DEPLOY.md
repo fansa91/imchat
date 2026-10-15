@@ -159,9 +159,9 @@ curl -s http://127.0.0.1:8092/healthz
 | `jwt.secret` | 登录令牌签名密钥，至少 32 位随机串（install.sh 已自动生成）。**修改后所有用户需重新登录** |
 | `jwt.ttl_hours` | 登录有效期，默认 720（30 天） |
 
-### storage（语音存储，S3 兼容）
+### storage（语音/图片存储，S3 兼容）
 
-不需要语音时整段删除（或写 `enabled: false`），其他功能不受影响。
+不需要语音和图片时整段删除（或写 `enabled: false`），其他功能不受影响。
 
 | 字段 | 说明 | 示例 |
 | --- | --- | --- |
@@ -177,11 +177,46 @@ curl -s http://127.0.0.1:8092/healthz
 | `voice_max_seconds` | 单条语音最长秒数 | `60` |
 | `voice_max_bytes` | 单条语音最大字节数 | `2097152`（2MB） |
 | `set_lifecycle` | 启动时自动设置生命周期 + CORS（密钥需要 **owner** 权限） | `true` |
-| `verify_upload` | 发送语音时服务端校验对象大小和文件头（每条 2 次 S3 请求）；跨地域嫌慢可改 `false` | `true` |
+| `verify_upload` | 发送语音/图片时服务端校验对象大小和文件头（每条 2 次 S3 请求）；跨地域嫌慢可改 `false` | `true` |
 | `presign_put_seconds` / `presign_get_seconds` | 上传/下载链接有效期 | `300` |
+| `image_max_bytes` | **v0.3.0** 单张图片最大字节数（JPEG/PNG/WebP/GIF） | `10485760`（10MB，默认） |
+| `image_ttl_days` | **v0.3.0** 服务器保留图片的天数；`0` = 永久保存，不加生命周期规则；大于 0 时启动时为 `image/` 前缀写规则 | `0`（默认） |
 
 > `endpoint` 和 `public_endpoint` 可以不同：例如 imserver 走内网 `10.0.0.25:3900`（`use_ssl: false`），浏览器走 `https://s3.fansa.ccwu.cc:8443`。
 > 但 S3 签名包含 Host，`public_endpoint` 必须和浏览器实际访问的 `域名:端口` **完全一致**。
+
+### stt（语音转文字，v0.3.0，默认关闭）
+
+服务端从存储读取语音（webm/opus 或 m4a 原样），送给 Groq 或 Cloudflare Workers AI 转写；结果缓存在数据库，同一条语音只转一次。需要 `storage` 已启用。
+
+| 字段 | 说明 | 默认 |
+| --- | --- | --- |
+| `enabled` | 总开关 | `false` |
+| `provider` | 主提供方：`groq` / `cloudflare`（开启时必须填好它的凭据，否则启动报错） | `groq` |
+| `fallback` | 主提供方 5xx / 超时 / 429 / 网络错误时尝试的备用提供方；可留空；未填凭据则忽略 | 空 |
+| `language` | 语言代码，留空自动识别 | `zh` |
+| `daily_limit_per_user` | 每用户每天次数（Asia/Shanghai 0 点重置，Redis 计数），`0` 不限；缓存命中不计次，失败自动退回 | `50` |
+| `timeout_seconds` | 单次请求提供方超时 | `30` |
+| `groq.api_key` | Groq API Key（https://console.groq.com/keys） | 空 |
+| `groq.model` | | `whisper-large-v3-turbo` |
+| `groq.base_url` | 一般不用改（测试/代理用） | `https://api.groq.com/openai/v1` |
+| `cloudflare.account_id` / `cloudflare.api_token` | Cloudflare 账号 ID 和带 Workers AI 权限的 API Token | 空 |
+| `cloudflare.model` | | `@cf/openai/whisper-large-v3-turbo` |
+| `cloudflare.base_url` | 一般不用改（测试/代理用） | `https://api.cloudflare.com/client/v4` |
+
+```yaml
+stt:
+  enabled: true
+  provider: groq
+  fallback: cloudflare
+  groq:
+    api_key: "gsk_..."
+  cloudflare:
+    account_id: "..."
+    api_token: "..."
+```
+
+开启后网页端/App 的语音消息长按（右键）菜单出现“转文字”。`/api/config` 返回 `stt_enabled: true` 即生效。
 
 ### group / message / log
 

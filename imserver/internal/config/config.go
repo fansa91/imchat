@@ -18,6 +18,7 @@ type Config struct {
 	Group   GroupConfig   `yaml:"group"`
 	Message MessageConfig `yaml:"message"`
 	Storage StorageConfig `yaml:"storage"`
+	STT     STTConfig     `yaml:"stt"`
 	Log     LogConfig     `yaml:"log"`
 }
 
@@ -82,7 +83,50 @@ type StorageConfig struct {
 	VoiceMaxSeconds   int      `yaml:"voice_max_seconds"`   // 单条语音时长上限，默认 60
 	PresignPutSeconds int      `yaml:"presign_put_seconds"` // 上传链接有效期，默认 300
 	PresignGetSeconds int      `yaml:"presign_get_seconds"` // 下载链接有效期，默认 300
-	VerifyUpload      bool     `yaml:"verify_upload"`       // 发送语音时服务端检查对象（大小+文件头，2 次请求），默认 true；跨地域可关
+	VerifyUpload      bool     `yaml:"verify_upload"`       // 发送语音/图片时服务端检查对象（大小+文件头，2 次请求），默认 true；跨地域可关
+	ImageMaxBytes     int64    `yaml:"image_max_bytes"`     // v0.3.0：单张图片大小上限，默认 10MB
+	ImageTTLDays      int      `yaml:"image_ttl_days"`      // v0.3.0：服务器保留图片的天数，默认 0 = 永久（不加生命周期规则）
+}
+
+// STTConfig 语音转文字（v0.3.0）。默认关闭。
+type STTConfig struct {
+	Enabled           bool          `yaml:"enabled"`
+	Provider          string        `yaml:"provider"`             // groq | cloudflare
+	Fallback          string        `yaml:"fallback"`             // 可留空；主提供方 5xx/超时/429 时尝试
+	Language          string        `yaml:"language"`             // 可留空让模型自动识别
+	DailyLimitPerUser int           `yaml:"daily_limit_per_user"` // 每用户每天（Asia/Shanghai 日界）次数，0 = 不限
+	TimeoutSeconds    int           `yaml:"timeout_seconds"`      // 单次请求提供方的超时
+	Groq              GroqSTT       `yaml:"groq"`
+	Cloudflare        CloudflareSTT `yaml:"cloudflare"`
+}
+
+type GroqSTT struct {
+	APIKey  string `yaml:"api_key"`
+	Model   string `yaml:"model"`
+	BaseURL string `yaml:"base_url"` // 默认 https://api.groq.com/openai/v1（测试/代理时可改）
+}
+
+type CloudflareSTT struct {
+	AccountID string `yaml:"account_id"`
+	APIToken  string `yaml:"api_token"`
+	Model     string `yaml:"model"`
+	BaseURL   string `yaml:"base_url"` // 默认 https://api.cloudflare.com/client/v4（测试/代理时可改）
+}
+
+const (
+	DefaultGroqBaseURL       = "https://api.groq.com/openai/v1"
+	DefaultCloudflareBaseURL = "https://api.cloudflare.com/client/v4"
+)
+
+// Configured 该提供方的凭据是否已填写。
+func (s STTConfig) Configured(provider string) bool {
+	switch provider {
+	case "groq":
+		return s.Groq.APIKey != ""
+	case "cloudflare":
+		return s.Cloudflare.AccountID != "" && s.Cloudflare.APIToken != ""
+	}
+	return false
 }
 
 // PublicURL 解析 public_endpoint，返回 host 和是否 https。
@@ -130,6 +174,12 @@ func Load(path string) (*Config, error) {
 		Storage: StorageConfig{
 			Bucket: "imchat", Region: "garage", VoiceTTLDays: 7, SetLifecycle: true,
 			VoiceMaxBytes: 2 << 20, VoiceMaxSeconds: 60, PresignPutSeconds: 300, PresignGetSeconds: 300, VerifyUpload: true,
+			ImageMaxBytes: 10 << 20, ImageTTLDays: 0,
+		},
+		STT: STTConfig{
+			Enabled: false, Provider: "groq", Fallback: "", Language: "zh", DailyLimitPerUser: 50, TimeoutSeconds: 30,
+			Groq:       GroqSTT{Model: "whisper-large-v3-turbo", BaseURL: DefaultGroqBaseURL},
+			Cloudflare: CloudflareSTT{Model: "@cf/openai/whisper-large-v3-turbo", BaseURL: DefaultCloudflareBaseURL},
 		},
 		Log: LogConfig{Level: "info"},
 	}
@@ -182,6 +232,50 @@ func Load(path string) (*Config, error) {
 		}
 		if s.PresignGetSeconds <= 0 {
 			s.PresignGetSeconds = 300
+		}
+		if s.ImageMaxBytes <= 0 {
+			s.ImageMaxBytes = 10 << 20
+		}
+		if s.ImageTTLDays < 0 {
+			s.ImageTTLDays = 0
+		}
+	}
+	if t := &cfg.STT; t.Enabled {
+		t.Provider = strings.ToLower(strings.TrimSpace(t.Provider))
+		t.Fallback = strings.ToLower(strings.TrimSpace(t.Fallback))
+		if t.Provider == "" {
+			t.Provider = "groq"
+		}
+		for _, p := range []string{t.Provider, t.Fallback} {
+			if p != "" && p != "groq" && p != "cloudflare" {
+				return nil, fmt.Errorf("stt.provider / stt.fallback 只能是 groq 或 cloudflare，当前 %q", p)
+			}
+		}
+		if !t.Configured(t.Provider) {
+			return nil, fmt.Errorf("stt.enabled=true 但主提供方 %s 未配置凭据（groq.api_key 或 cloudflare.account_id/api_token）", t.Provider)
+		}
+		if t.Fallback == t.Provider {
+			t.Fallback = ""
+		}
+		if t.TimeoutSeconds <= 0 {
+			t.TimeoutSeconds = 30
+		}
+		if t.DailyLimitPerUser < 0 {
+			t.DailyLimitPerUser = 0
+		}
+		if t.Groq.Model == "" {
+			t.Groq.Model = "whisper-large-v3-turbo"
+		}
+		if t.Cloudflare.Model == "" {
+			t.Cloudflare.Model = "@cf/openai/whisper-large-v3-turbo"
+		}
+		t.Groq.BaseURL = strings.TrimRight(t.Groq.BaseURL, "/")
+		if t.Groq.BaseURL == "" {
+			t.Groq.BaseURL = DefaultGroqBaseURL
+		}
+		t.Cloudflare.BaseURL = strings.TrimRight(t.Cloudflare.BaseURL, "/")
+		if t.Cloudflare.BaseURL == "" {
+			t.Cloudflare.BaseURL = DefaultCloudflareBaseURL
 		}
 	}
 	return cfg, nil

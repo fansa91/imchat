@@ -33,12 +33,19 @@ func (s *Server) clientConfig(w http.ResponseWriter, r *http.Request, uid uint64
 		"group_max_members": s.cfg.Group.MaxMembers,
 		"reactions":         DefaultReactions,
 		"voice_enabled":     s.storage != nil,
+		// v0.3.0
+		"image_enabled":    s.storage != nil,
+		"image_max_bytes":  s.cfg.Storage.ImageMaxBytes,
+		"presence_enabled": true,
+		"stt_enabled":      s.stt != nil,
 	}
 	if s.storage != nil {
 		c := s.storage.Config()
 		out["voice_max_seconds"] = c.VoiceMaxSeconds
 		out["voice_max_bytes"] = c.VoiceMaxBytes
 		out["voice_ttl_days"] = c.VoiceTTLDays
+		out["image_max_bytes"] = c.ImageMaxBytes
+		out["image_ttl_days"] = c.ImageTTLDays
 	}
 	writeJSON(w, 200, out)
 }
@@ -463,10 +470,12 @@ func (s *Server) presignUpload(w http.ResponseWriter, r *http.Request, uid uint6
 		return
 	}
 	var req struct {
-		Kind       string `json:"kind"` // voice（后续可加 image）
+		Kind       string `json:"kind"` // voice | image
 		Mime       string `json:"mime"`
 		Size       int64  `json:"size"`
-		DurationMs int    `json:"duration_ms"`
+		DurationMs int    `json:"duration_ms"` // voice
+		Width      int    `json:"width"`       // image（可选，仅校验非负）
+		Height     int    `json:"height"`      // image
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "bad_request", "参数错误")
@@ -499,8 +508,33 @@ func (s *Server) presignUpload(w http.ResponseWriter, r *http.Request, uid uint6
 			"key": key, "url": u, "method": "PUT", "headers": map[string]string{"Content-Type": mime},
 			"expires_at": exp.UTC().Format(time.RFC3339), "max_bytes": cfg.VoiceMaxBytes,
 		})
+	case "image":
+		mime, ext, ok := storage.NormalizeImageMime(req.Mime)
+		if !ok {
+			writeErr(w, 400, "bad_mime", "只支持 JPEG / PNG / WebP / GIF 图片")
+			return
+		}
+		if req.Size <= 0 || req.Size > cfg.ImageMaxBytes {
+			writeErr(w, 400, "too_large", fmt.Sprintf("图片不能超过 %d MB", cfg.ImageMaxBytes>>20))
+			return
+		}
+		if req.Width < 0 || req.Height < 0 {
+			writeErr(w, 400, "bad_request", "图片宽高无效")
+			return
+		}
+		key := storage.NewKey("image", uid, ext)
+		u, exp, err := s.storage.PresignPut(r.Context(), key)
+		if err != nil {
+			slog.Error("presign put", "err", err)
+			writeErr(w, 500, "internal", "生成上传链接失败")
+			return
+		}
+		writeJSON(w, 200, map[string]any{
+			"key": key, "url": u, "method": "PUT", "headers": map[string]string{"Content-Type": mime},
+			"expires_at": exp.UTC().Format(time.RFC3339), "max_bytes": cfg.ImageMaxBytes,
+		})
 	default:
-		writeErr(w, 400, "bad_kind", "kind 目前只支持 voice")
+		writeErr(w, 400, "bad_kind", "kind 只支持 voice 或 image")
 	}
 }
 
@@ -529,7 +563,7 @@ func (s *Server) mediaURL(w http.ResponseWriter, r *http.Request, uid uint64) {
 		writeErr(w, 410, "recalled", "消息已撤回")
 		return
 	}
-	if m.MsgType != store.MsgVoice {
+	if m.MsgType != store.MsgVoice && m.MsgType != store.MsgImage {
 		writeErr(w, 400, "not_media", "不是媒体消息")
 		return
 	}
@@ -537,22 +571,27 @@ func (s *Server) mediaURL(w http.ResponseWriter, r *http.Request, uid uint64) {
 		writeErr(w, 503, "storage_disabled", "服务器未启用文件存储")
 		return
 	}
-	var v ws.VoiceContent
-	if json.Unmarshal([]byte(m.Content), &v) != nil || v.Key == "" {
+	key, mime, size := ws.MediaKey(m.Content)
+	if key == "" {
 		writeErr(w, 404, "not_found", "文件不存在")
 		return
 	}
 	// 不访问对象存储（跨地域部署时省一次往返）：按消息时间判断是否已被生命周期删除。
-	// 生命周期按天执行，边界附近对象可能已删也可能还在，客户端下载 404 时同样显示“语音已过期”。
-	ttl := time.Duration(s.storage.Config().VoiceTTLDays) * 24 * time.Hour
-	if time.Since(m.CreatedAt) > ttl {
-		writeErr(w, 410, "expired", "语音已过期")
+	// 生命周期按天执行，边界附近对象可能已删也可能还在，客户端下载 404 时同样显示“已过期”。
+	cfg := s.storage.Config()
+	if m.MsgType == store.MsgVoice {
+		if time.Since(m.CreatedAt) > time.Duration(cfg.VoiceTTLDays)*24*time.Hour {
+			writeErr(w, 410, "expired", "语音已过期")
+			return
+		}
+	} else if cfg.ImageTTLDays > 0 && time.Since(m.CreatedAt) > time.Duration(cfg.ImageTTLDays)*24*time.Hour {
+		writeErr(w, 410, "expired", "图片已过期")
 		return
 	}
-	u, exp, err := s.storage.PresignGet(ctx, v.Key, v.Mime)
+	u, exp, err := s.storage.PresignGet(ctx, key, mime)
 	if err != nil {
 		writeErr(w, 500, "internal", "生成下载链接失败")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"url": u, "mime": v.Mime, "size": v.Size, "expires_at": exp.UTC().Format(time.RFC3339)})
+	writeJSON(w, 200, map[string]any{"url": u, "mime": mime, "size": size, "expires_at": exp.UTC().Format(time.RFC3339)})
 }

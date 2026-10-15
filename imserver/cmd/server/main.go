@@ -20,10 +20,11 @@ import (
 	"imserver/internal/push"
 	"imserver/internal/storage"
 	"imserver/internal/store"
+	"imserver/internal/stt"
 	"imserver/internal/ws"
 )
 
-var version = "dev" // 编译时通过 -ldflags "-X main.version=..." 注入
+var version = "v0.3.0" // 编译时通过 -ldflags "-X main.version=..." 覆盖
 
 func main() {
 	cfgPath := flag.String("c", "config.yaml", "配置文件路径")
@@ -76,7 +77,16 @@ func run(cfgPath string) error {
 		return err
 	}
 	if stg == nil {
-		slog.Warn("对象存储未启用（storage.enabled=false），语音消息不可用")
+		slog.Warn("对象存储未启用（storage.enabled=false），语音/图片消息不可用")
+	}
+
+	tr := stt.New(cfg.STT)
+	switch {
+	case tr != nil && stg == nil:
+		slog.Warn("stt.enabled=true 但对象存储未启用，语音转文字不可用")
+		tr = nil
+	case tr != nil:
+		slog.Info("语音转文字已启用", "provider", cfg.STT.Provider, "fallback", tr.Config().Fallback, "daily_limit", cfg.STT.DailyLimitPerUser)
 	}
 
 	hub := ws.NewHub(rdb, cfg.Server.NodeID)
@@ -89,7 +99,7 @@ func run(cfgPath string) error {
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           api.New(cfg, st, auth.New(cfg.JWT.Secret, cfg.JWT.TTL()), hub, push.LogNotifier{}, stg).Routes(),
+		Handler:           api.New(cfg, st, auth.New(cfg.JWT.Secret, cfg.JWT.TTL()), hub, push.LogNotifier{}, stg, tr, rdb).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errCh := make(chan error, 1)

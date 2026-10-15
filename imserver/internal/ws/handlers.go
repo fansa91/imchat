@@ -80,6 +80,14 @@ func (c *Client) handleSend(ctx context.Context, env Envelope) {
 		}
 		req.Content = content
 	}
+	if req.MsgType == store.MsgImage {
+		content, code, msg := c.validateImage(ctx, req.Content)
+		if code != "" {
+			c.fail(env.ID, code, msg)
+			return
+		}
+		req.Content = content
+	}
 	members, err := c.store.Members(ctx, req.ConversationID)
 	if err != nil {
 		c.fail(env.ID, "internal", "服务器错误")
@@ -180,6 +188,55 @@ func (c *Client) validateVoice(ctx context.Context, raw string) (content, code, 
 	return string(out), "", ""
 }
 
+// maxImageSide 宽高上限（防止明显错误的声明；客户端压缩后长边 ≤ 2048，GIF 原样）。
+const maxImageSide = 30000
+
+// validateImage 校验图片消息：key 属于自己的 image/ 前缀、宽高合法、对象已上传且大小/格式合格。
+// 返回规范化后的 content。
+func (c *Client) validateImage(ctx context.Context, raw string) (content, code, msg string) {
+	st := c.deps.Storage
+	if st == nil {
+		return "", "unsupported", "服务器未启用图片消息"
+	}
+	var v ImageContent
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return "", "bad_request", "图片消息格式错误"
+	}
+	kind, owner, ok := storage.ParseKey(v.Key)
+	if !ok || kind != "image" || owner != c.userID {
+		return "", "bad_request", "无效的图片文件"
+	}
+	mime, _, ok := storage.NormalizeImageMime(v.Mime)
+	if !ok {
+		return "", "bad_request", "不支持的图片格式"
+	}
+	if v.Width <= 0 || v.Height <= 0 || v.Width > maxImageSide || v.Height > maxImageSide {
+		return "", "bad_request", "图片宽高无效"
+	}
+	if !st.Config().VerifyUpload {
+		if v.Size <= 0 || v.Size > st.Config().ImageMaxBytes {
+			return "", "bad_request", "图片大小无效"
+		}
+		out, _ := json.Marshal(ImageContent{Key: v.Key, Mime: mime, Size: v.Size, Width: v.Width, Height: v.Height})
+		return string(out), "", ""
+	}
+	vctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	info, err := st.VerifyImage(vctx, v.Key, mime)
+	if errors.Is(err, storage.ErrNotFound) {
+		return "", "bad_request", "图片未上传或已过期"
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "图片") {
+			return "", "bad_request", err.Error()
+		}
+		slog.Error("verify image", "err", err)
+		return "", "internal", "对象存储错误"
+	}
+	out, _ := json.Marshal(ImageContent{Key: v.Key, Mime: info.Mime, Size: info.Size, Width: v.Width, Height: v.Height})
+	return string(out), "", ""
+}
+
 func (c *Client) handleRecall(ctx context.Context, env Envelope) {
 	var req recallReq
 	if err := json.Unmarshal(env.Data, &req); err != nil || req.Seq == 0 {
@@ -208,17 +265,21 @@ func (c *Client) handleRecall(ctx context.Context, env Envelope) {
 		c.fail(env.ID, "internal", "服务器错误")
 		return
 	}
-	// 撤回的语音同时删除服务器上的文件
-	if before.MsgType == store.MsgVoice && c.deps.Storage != nil {
-		var v VoiceContent
-		if json.Unmarshal([]byte(before.Content), &v) == nil && v.Key != "" {
+	// 撤回的语音/图片同时删除服务器上的文件；语音的转文字结果一并删除
+	if (before.MsgType == store.MsgVoice || before.MsgType == store.MsgImage) && c.deps.Storage != nil {
+		if key, _, _ := MediaKey(before.Content); key != "" {
 			go func() {
 				rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				if err := c.deps.Storage.Remove(rctx, v.Key); err != nil {
-					slog.Warn("remove recalled voice", "key", v.Key, "err", err)
+				if err := c.deps.Storage.Remove(rctx, key); err != nil {
+					slog.Warn("remove recalled media", "key", key, "err", err)
 				}
 			}()
+		}
+	}
+	if before.MsgType == store.MsgVoice {
+		if err := c.store.DeleteTranscript(ctx, req.ConversationID, req.Seq); err != nil {
+			slog.Warn("delete transcript", "conversation", req.ConversationID, "seq", req.Seq, "err", err)
 		}
 	}
 	data := map[string]any{

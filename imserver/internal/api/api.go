@@ -14,12 +14,14 @@ import (
 	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 
 	"imserver/internal/auth"
 	"imserver/internal/config"
 	"imserver/internal/push"
 	"imserver/internal/storage"
 	"imserver/internal/store"
+	"imserver/internal/stt"
 	"imserver/internal/ws"
 )
 
@@ -29,14 +31,17 @@ type Server struct {
 	hub      *ws.Hub
 	push     push.Notifier
 	storage  *storage.Storage // 可能为 nil（未启用对象存储）
+	stt      *stt.Transcriber // 可能为 nil（未启用语音转文字）
+	rdb      *redis.Client
 	cfg      *config.Config
 	deps     *ws.Deps
 	upgrader websocket.Upgrader
 }
 
-func New(cfg *config.Config, st *store.Store, am *auth.Manager, hub *ws.Hub, p push.Notifier, stg *storage.Storage) *Server {
+func New(cfg *config.Config, st *store.Store, am *auth.Manager, hub *ws.Hub, p push.Notifier, stg *storage.Storage,
+	tr *stt.Transcriber, rdb *redis.Client) *Server {
 	allowOrigins := cfg.Server.AllowOrigins
-	s := &Server{store: st, auth: am, hub: hub, push: p, storage: stg, cfg: cfg}
+	s := &Server{store: st, auth: am, hub: hub, push: p, storage: stg, stt: tr, rdb: rdb, cfg: cfg}
 	s.deps = &ws.Deps{Store: st, Push: p, Storage: stg, RecallWindow: cfg.Message.RecallWindow()}
 	s.upgrader = websocket.Upgrader{
 		ReadBufferSize:  4096,
@@ -84,6 +89,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/conversations/{id}/hidden", s.authed(s.hiddenSeqs))
 	mux.HandleFunc("GET /api/conversations/{id}/messages/{seq}/media", s.authed(s.mediaURL))
 	mux.HandleFunc("POST /api/uploads/presign", s.authed(s.presignUpload))
+	// v0.3.0
+	mux.HandleFunc("GET /api/presence", s.authed(s.presence))
+	mux.HandleFunc("POST /api/conversations/{id}/messages/{seq}/transcribe", s.authed(s.transcribe))
 	mux.HandleFunc("GET /ws", s.websocket)
 	return logRequests(mux)
 }

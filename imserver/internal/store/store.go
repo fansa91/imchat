@@ -83,6 +83,8 @@ var upgradeColumns = []struct{ table, column, ddl string }{
 	{"messages", "recalled", "ADD COLUMN recalled TINYINT NOT NULL DEFAULT 0 AFTER reply_to_seq"},
 	{"messages", "recalled_at", "ADD COLUMN recalled_at DATETIME(3) NULL AFTER recalled"},
 	{"messages", "mod_seq", "ADD COLUMN mod_seq BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '撤回/回应变化时更新，用于离线同步变更' AFTER recalled_at"},
+	// v0.3.0
+	{"users", "last_seen_at", "ADD COLUMN last_seen_at DATETIME(3) NULL COMMENT '最后一个连接断开的时间' AFTER created_at"},
 }
 
 var upgradeIndexes = []struct{ table, index, ddl string }{

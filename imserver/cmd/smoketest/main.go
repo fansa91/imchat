@@ -1,6 +1,7 @@
 // smoketest 端到端冒烟测试。
 // v0.1：注册、单聊收发、多设备同步、幂等、已读、离线补拉。
 // v0.2：群聊、撤回、仅自己删除、引用回复、表情回应、语音上传（预签名）、生命周期规则。
+// v0.3：图片消息、在线状态（含跨实例）、语音转文字（假提供方）。
 // 用法: go run ./cmd/smoketest -base http://127.0.0.1:8092 -s3-endpoint 127.0.0.1:3900 -s3-key GK... -s3-secret ... -bucket imchat
 package main
 
@@ -106,6 +107,8 @@ func main() {
 	flag.StringVar(&s3Region, "s3-region", "garage", "S3 region（Garage 默认 garage）")
 	flag.StringVar(&webOrigin, "origin", "http://127.0.0.1:4173", "网页 Origin（检查 CORS 用）")
 	flag.BoolVar(&s3SSL, "s3-ssl", false, "S3 使用 https")
+	flag.StringVar(&sttBase, "stt-base", "", "v0.3.0：开启 stt 的第二个实例地址（其 stt.*.base_url 指向 -stt-stub），留空跳过转写成功路径")
+	flag.StringVar(&sttStubAddr, "stt-stub", "127.0.0.1:18099", "v0.3.0：假 STT 提供方监听地址")
 	flag.Parse()
 	suffix := fmt.Sprintf("%d%d", time.Now().Unix(), rand.Intn(1000))
 
@@ -190,5 +193,6 @@ func main() {
 	check(call("GET", "/api/me", "bad-token", nil, nil) == 401, "invalid token rejected")
 
 	v020(suffix, alice, bob, eve)
+	v030(suffix, alice, bob, eve)
 	fmt.Printf("\nALL PASSED (%d checks)\n", passed)
 }
