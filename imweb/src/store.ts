@@ -1,12 +1,13 @@
 import { api, ApiError, getToken, putWithProgress, setToken, setUnauthorizedHandler } from './api'
 import { Socket } from './socket'
 import { MSG_CALL, MSG_FILE, MSG_IMAGE, MSG_SYSTEM, MSG_TEXT, MSG_VIDEO, MSG_VOICE } from './types'
-import type { CallContent, ClientConfig, Conversation, FileContent, ImageContent, Member, Message, Presence, Reaction, SystemContent, User, VideoContent, VoiceContent } from './types'
-import { imageDB, requestPersist, transcriptDB, voiceDB, voiceKey, type Recording } from './voice'
+import type { CallContent, CallKind, ClientConfig, Conversation, FileContent, FriendEntry, FriendRequests, ImageContent, Member, Message, Presence, PublicUser, Reaction, SystemContent, User, VideoContent, VoiceContent } from './types'
+import { clearMediaCaches, imageDB, requestPersist, transcriptDB, voiceDB, voiceKey, type Recording } from './voice'
 import { prepareImage } from './image'
 import { probeVideo, sanitizeFileName, videoMimeOf } from './media'
 import { CallManager, type CallUiState } from './call'
-import { shortPreview } from './util'
+import { GroupCallManager, type GroupCallUiState } from './groupcall'
+import { displayName, shortPreview } from './util'
 
 export interface Thread {
   items: Message[] // 服务端已确认的消息，按 seq 升序
@@ -33,6 +34,21 @@ export class MediaError extends Error {
   }
 }
 
+/** v0.5.0：会话列表 / 群聊页展示的进行中群通话（由 group_call_* 事件维护） */
+export interface GroupRoomInfo {
+  callId: string
+  kind: CallKind
+  count: number
+}
+
+export interface GroupInvite {
+  callId: string
+  conversationId: number
+  kind: CallKind
+  creator: PublicUser
+  ts: number
+}
+
 export interface State {
   me: User | null
   booting: boolean
@@ -42,12 +58,18 @@ export interface State {
   threads: Record<number, Thread>
   reads: Record<number, Record<number, number>> // 会话 -> 成员 -> 已读 seq
   typing: Record<number, { uid: number; ts: number }> // 会话 -> 最近在输入的人
-  users: Record<number, User> // 已知用户（群成员名字/头像）
+  users: Record<number, PublicUser> // 已知用户（群成员名字/头像，他人视角不含 email）
   members: Record<number, Member[]> // 已加载的群成员
   voice: Record<string, VoiceState> // voiceKey -> 状态
   presence: Record<number, Presence> // 用户 -> 在线状态
   transcripts: Record<string, Transcript> // voiceKey -> 转文字结果
   call: CallUiState | null // v0.4.0：当前通话（无通话为 null）
+  // v0.5.0 好友 / 群通话
+  friends: Record<number, FriendEntry> // user_id -> 好友条目（含我的备注）
+  friendRequests: FriendRequests
+  groupRooms: Record<number, GroupRoomInfo> // conversation_id -> 进行中的群通话房间
+  groupCall: GroupCallUiState | null // 当前群通话（无通话为 null）
+  groupInvite: GroupInvite | null // 收到的群通话邀请横幅
   notice: string // 退出到登录页时的一次性提示（如 session_revoked）
   toast: string
 }
@@ -121,6 +143,11 @@ const initial = (): State => ({
   presence: {},
   transcripts: {},
   call: null,
+  friends: {},
+  friendRequests: { incoming: [], outgoing: [] },
+  groupRooms: {},
+  groupCall: null,
+  groupInvite: null,
   notice: '',
   toast: '',
 })
@@ -150,6 +177,24 @@ class Store {
     meId: () => this.state.me?.id,
     ringSeconds: () => this.state.config.call_ring_timeout_seconds ?? 60,
   })
+  /** v0.5.0：群通话（SFU 代理接口 + group_call_* 事件驱动） */
+  private groupCallMgr = new GroupCallManager({
+    onChange: (groupCall) => {
+      this.set({ groupCall })
+      // 兜底维护房间概要：自己发起/加入时服务端事件可能不回显给本人，
+      // 列表与群聊页的「通话中」条不能因此缺失
+      if (groupCall && !this.state.groupRooms[groupCall.conversationId]) {
+        this.set({
+          groupRooms: {
+            ...this.state.groupRooms,
+            [groupCall.conversationId]: { callId: groupCall.callId, kind: groupCall.kind, count: groupCall.participants.length + 1 },
+          },
+        })
+      }
+    },
+    toast: (msg) => this.showToast(msg),
+    meId: () => this.state.me?.id,
+  })
   private configReady: Promise<void> = Promise.resolve()
   /** 自己撤回的文本，用于“重新编辑” */
   recalledDrafts = new Map<string, string>()
@@ -172,6 +217,25 @@ class Store {
     // v0.4.0：通话信令转发给状态机；资料变更刷新用户缓存；登录被吊销回登录页
     for (const t of ['call_invite', 'call_accept', 'call_reject', 'call_cancel', 'call_hangup', 'call_signal', 'call_unavailable']) {
       this.socket.on(t, (d) => this.callMgr.handle(t, d))
+    }
+    // v0.5.0：好友事件——刷新好友/申请列表与红点，被删好友不弹提示（SPEC §1.3）
+    this.socket.on('friend_request', () => {
+      this.loadFriendRequests()
+      this.showToast('收到新的好友申请')
+    })
+    this.socket.on('friend_request_accepted', (d) => {
+      this.loadFriends()
+      this.loadFriendRequests()
+      if (d?.by) this.showToast(`${displayName(d.by)} 已通过你的好友申请`)
+    })
+    this.socket.on('friend_request_rejected', () => this.loadFriendRequests())
+    this.socket.on('friend_removed', () => this.loadFriends())
+    // v0.5.0：群通话事件——房间概要（列表/横幅）在这里维护，通话内事件转发给群通话状态机
+    for (const t of ['group_call_started', 'group_call_joined', 'group_call_tracks', 'group_call_tracks_closed', 'group_call_left', 'group_call_ended']) {
+      this.socket.on(t, (d) => {
+        this.onGroupCallEvent(t, d)
+        this.groupCallMgr.handle(t, d)
+      })
     }
     this.socket.on('user_updated', (d) => this.onUserUpdated(d?.user))
     this.socket.on('session_revoked', async () => {
@@ -212,7 +276,7 @@ class Store {
     const t = this.state.threads[id] ?? emptyThread()
     this.set({ threads: { ...this.state.threads, [id]: fn(t) } })
   }
-  private addUsers(list: (User | undefined)[]) {
+  private addUsers(list: (PublicUser | undefined)[]) {
     const users = { ...this.state.users }
     let changed = false
     for (const u of list) {
@@ -274,6 +338,8 @@ class Store {
       .then((config) => this.set({ config: { ...DEFAULT_CONFIG, ...config } }))
       .catch(() => {})
     this.loadConversations().catch(() => {})
+    this.loadFriends()
+    this.loadFriendRequests()
   }
 
   async login(email: string, password: string, register = false, nickname = '') {
@@ -286,6 +352,7 @@ class Store {
 
   logout(notice = '') {
     this.callMgr.dispose()
+    this.groupCallMgr.dispose()
     this.socket.stop()
     setToken('')
     this.timers.forEach((t) => clearTimeout(t))
@@ -338,6 +405,10 @@ class Store {
     try {
       await this.loadConversations()
       this.refreshPresence()
+      // v0.5.0：WS 重连后恢复群通话的成员与订阅（媒体本身不走 WS，不受断线影响）
+      if (this.state.groupCall) this.groupCallMgr.recover()
+      this.loadFriends()
+      this.loadFriendRequests()
       for (const [idStr, t] of Object.entries(this.state.threads)) {
         const id = Number(idStr)
         if (!t.loaded) continue
@@ -460,6 +531,11 @@ class Store {
 
   async startChatByEmail(email: string) {
     const user = await api.searchUser(email.trim())
+    return this.openDirectWith(user)
+  }
+
+  /** 与任意用户打开（或新建）单聊，返回会话 ID（v0.5.0 好友页发消息/通话共用） */
+  async openDirectWith(user: PublicUser) {
     const { conversation_id } = await api.openDirect(user.id)
     if (!this.state.convs[conversation_id]) {
       await this.loadConversations()
@@ -553,6 +629,7 @@ class Store {
       for (const u of c.members_preview ?? []) ids.add(u.id)
     }
     for (const list of Object.values(this.state.members)) for (const m of list) ids.add(m.user.id)
+    for (const f of Object.values(this.state.friends)) ids.add(f.user.id)
     if (this.state.me) ids.delete(this.state.me.id)
     await this.loadPresence([...ids])
   }
@@ -1184,10 +1261,43 @@ class Store {
     return u
   }
 
-  async updateProfile(patch: { nickname?: string; avatar_key?: string }) {
+  async updateProfile(patch: { nickname?: string; avatar_key?: string; allow_find?: boolean }) {
     const user = await api.patchMe(patch)
     this.set({ me: user, users: { ...this.state.users, [user.id]: user } })
     return user
+  }
+
+  /**
+   * v0.5.0：退出其他设备。换上服务端新 token 后主动重连 WS：
+   * 旧连接随后被服务端踢掉时，session_revoked 的校验用新 token 能通过，不会误登出。
+   */
+  async revokeOtherSessions() {
+    const r = await api.revokeOtherSessions()
+    setToken(r.token)
+    this.socket.stop()
+    this.socket.start()
+    this.showToast('已退出其他设备')
+  }
+
+  /** v0.5.0「我的 → 存储」：清本地媒体缓存并重置内存里的媒体状态 */
+  async clearCaches() {
+    await clearMediaCaches().catch(() => {})
+    this.blobUrls.forEach((u) => URL.revokeObjectURL(u))
+    this.blobUrls.clear()
+    this.blobs.clear()
+    this.imageLoads.clear()
+    this.set({ voice: {}, transcripts: {} })
+    this.showToast('缓存已清理')
+  }
+
+  /** 本地缓存占用估算（浏览器口径，含 IndexedDB 等） */
+  async storageUsage(): Promise<number | null> {
+    try {
+      const est = await navigator.storage?.estimate?.()
+      return est?.usage ?? null
+    } catch {
+      return null
+    }
   }
 
   /** 已登录改密码：用服务端返回的新 token 无感续用（其他设备的旧 token 已被吊销） */
@@ -1218,6 +1328,182 @@ class Store {
   }
   toggleCallCamera() {
     this.callMgr.toggleCamera()
+  }
+
+  // ---------- v0.5.0 好友 ----------
+
+  async loadFriends() {
+    try {
+      const list = await api.friends()
+      const friends: Record<number, FriendEntry> = {}
+      for (const f of list) friends[f.user.id] = f
+      this.set({ friends })
+      this.addUsers(list.map((f) => f.user))
+      // presence 服务开启时，好友在线点跟随实时 presence；未开启时用列表的 online 快照
+      if (list.length) this.loadPresence(list.map((f) => f.user.id))
+    } catch {}
+  }
+
+  async loadFriendRequests() {
+    try {
+      const r = await api.friendRequests()
+      this.set({ friendRequests: r })
+      this.addUsers([...r.incoming, ...r.outgoing].map((x) => x.user))
+    } catch {}
+  }
+
+  /** 发送申请；服务端在反向有待处理申请时直接成友（status=accepted） */
+  async sendFriendRequest(userId: number, message?: string) {
+    const r = await api.sendFriendRequest(userId, message)
+    await this.loadFriendRequests()
+    if (r.status === 'accepted') {
+      await this.loadFriends()
+      this.showToast('已成为好友')
+    } else {
+      this.showToast('好友申请已发送')
+    }
+    return r
+  }
+
+  async acceptFriendRequest(id: number) {
+    await api.acceptFriendRequest(id)
+    await Promise.all([this.loadFriends(), this.loadFriendRequests()])
+    this.showToast('已添加好友')
+  }
+
+  async rejectFriendRequest(id: number) {
+    await api.rejectFriendRequest(id)
+    await this.loadFriendRequests()
+  }
+
+  async cancelFriendRequest(id: number) {
+    await api.cancelFriendRequest(id)
+    await this.loadFriendRequests()
+  }
+
+  /** 搜索结果卡上的「接受」：只有 relation 没有请求 id，按用户找 incoming 申请 */
+  async acceptFriendByUser(userId: number) {
+    let item = this.state.friendRequests.incoming.find((x) => x.user.id === userId)
+    if (!item) {
+      await this.loadFriendRequests()
+      item = this.state.friendRequests.incoming.find((x) => x.user.id === userId)
+    }
+    if (item) await this.acceptFriendRequest(item.id)
+  }
+
+  async setFriendRemark(userId: number, remark: string) {
+    await api.patchFriend(userId, remark)
+    await this.loadFriends()
+    this.showToast(remark ? '备注已保存' : '备注已清除')
+  }
+
+  async removeFriend(userId: number) {
+    await api.removeFriend(userId)
+    await this.loadFriends()
+    this.showToast('已删除好友')
+  }
+
+  // ---------- v0.5.0 群通话 ----------
+
+  startGroupCall(conversationId: number, kind: CallKind) {
+    if (!this.state.config.group_call_enabled) return this.showToast('服务器未开启群通话')
+    if (this.state.call) return this.showToast('已在通话中')
+    if (this.state.groupRooms[conversationId]) return this.joinGroupCall(conversationId)
+    void this.groupCallMgr.start(conversationId, kind)
+  }
+
+  joinGroupCall(conversationId: number) {
+    const room = this.state.groupRooms[conversationId]
+    if (!room) return this.showToast('通话已结束')
+    if (this.state.call) return this.showToast('已在通话中')
+    void this.groupCallMgr.join(room.callId, conversationId, room.kind)
+  }
+
+  async leaveGroupCall() {
+    const convId = this.state.groupCall?.conversationId
+    await this.groupCallMgr.leave()
+    if (convId) {
+      const groupRooms = { ...this.state.groupRooms }
+      delete groupRooms[convId]
+      this.set({ groupRooms })
+    }
+  }
+
+  toggleGroupMute() {
+    this.groupCallMgr.toggleMute()
+  }
+  toggleGroupCamera() {
+    this.groupCallMgr.toggleCamera()
+  }
+
+  clearGroupInvite() {
+    if (this.state.groupInvite) this.set({ groupInvite: null })
+  }
+
+  /** 群通话房间概要维护：人数增减、邀请横幅、结束清理（通话内事件另由 groupCallMgr 处理） */
+  private onGroupCallEvent(type: string, d: any) {
+    if (!d) return
+    const meId = this.state.me?.id
+    const rooms = { ...this.state.groupRooms }
+    const byCallId = (callId: string) => Object.entries(rooms).find(([, r]) => r.callId === callId)
+    switch (type) {
+      case 'group_call_started': {
+        const convId = Number(d.conversation_id)
+        if (!convId) return
+        rooms[convId] = { callId: d.call_id, kind: d.kind === 'video' ? 'video' : 'audio', count: Math.max(1, rooms[convId]?.count ?? 1) }
+        this.set({ groupRooms: rooms })
+        // creator 可能是 user_id 或 PublicUser（SPEC 未写死），两种都兼容
+        const creator: PublicUser =
+          d.creator && typeof d.creator === 'object'
+            ? d.creator
+            : (this.state.users[Number(d.creator ?? d.from_user_id)] ?? { id: Number(d.creator ?? d.from_user_id) || 0, nickname: '', avatar_url: '' })
+        if (creator.id && creator.id !== meId && !this.state.groupCall && this.state.groupInvite?.callId !== d.call_id) {
+          this.set({
+            groupInvite: { callId: d.call_id, conversationId: convId, kind: d.kind === 'video' ? 'video' : 'audio', creator, ts: Date.now() },
+          })
+        }
+        return
+      }
+      case 'group_call_joined': {
+        const hit = byCallId(d.call_id)
+        if (hit) {
+          const [cid, r] = hit
+          // 自己在通话里时人数以参与者名单为准，避免事件与名单双计
+          const gc = this.state.groupCall
+          const count = gc && gc.callId === d.call_id ? gc.participants.length + 1 : r.count + 1
+          rooms[Number(cid)] = { ...r, count }
+          this.set({ groupRooms: rooms })
+        }
+        return
+      }
+      case 'group_call_left': {
+        const hit = byCallId(d.call_id)
+        if (hit) {
+          const [cid, r] = hit
+          const gc = this.state.groupCall
+          const count = gc && gc.callId === d.call_id ? gc.participants.length + 1 : r.count - 1
+          if (count <= 0) delete rooms[Number(cid)]
+          else rooms[Number(cid)] = { ...r, count }
+          this.set({ groupRooms: rooms })
+        }
+        return
+      }
+      case 'group_call_ended': {
+        const convId = Number(d.conversation_id)
+        if (convId && rooms[convId]?.callId === d.call_id) {
+          delete rooms[convId]
+          this.set({ groupRooms: rooms })
+        } else {
+          const hit = byCallId(d.call_id)
+          if (hit) {
+            delete rooms[Number(hit[0])]
+            this.set({ groupRooms: rooms })
+          }
+        }
+        if (this.state.groupInvite?.callId === d.call_id) this.set({ groupInvite: null })
+        return
+      }
+    }
   }
 }
 

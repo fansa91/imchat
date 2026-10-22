@@ -4,6 +4,42 @@ export interface User {
   nickname: string
   avatar_url: string
   created_at: string
+  /** v0.5.0：仅 GET /api/me 返回——隐私开关「允许通过邮箱 / 用户 ID 找到我」 */
+  allow_find?: boolean
+}
+
+/** v0.5.0 他人视角的用户结构（SPEC §1.2）：不含 email */
+export interface PublicUser {
+  id: number
+  nickname: string
+  avatar_url: string
+}
+
+/** v0.5.0 好友关系状态（对搜索者而言，SPEC §1.3） */
+export type FriendRelation = 'none' | 'friend' | 'pending_out' | 'pending_in'
+
+export interface UserSearchResult extends PublicUser {
+  relation: FriendRelation
+}
+
+/** v0.5.0 好友列表项（SPEC §1.3）：remark 是我给对方的备注（单向） */
+export interface FriendEntry {
+  user: PublicUser
+  remark: string
+  online: boolean
+  created_at: string
+}
+
+export interface FriendRequestItem {
+  id: number
+  user: PublicUser
+  message: string
+  created_at: string
+}
+
+export interface FriendRequests {
+  incoming: FriendRequestItem[]
+  outgoing: FriendRequestItem[]
 }
 
 export type MsgStatus = 'sending' | 'failed' | 'sent'
@@ -90,13 +126,56 @@ export interface FileContent {
 export type CallKind = 'audio' | 'video'
 export type CallOutcome = 'completed' | 'missed' | 'rejected' | 'cancelled' | 'busy' | 'failed'
 
-/** 通话记录消息 content（JSON），v0.4.0（SPEC §1.4），只能由服务端生成 */
+/** 通话记录消息 content（JSON），v0.4.0（SPEC §1.4），只能由服务端生成；v0.5.0 扩展群通话字段 */
 export interface CallContent {
   call_id: string
   kind: CallKind
   outcome: CallOutcome
   duration_ms: number
   caller_id: number
+  /** v0.5.0：single | group，缺失按 single */
+  mode?: 'single' | 'group'
+  participant_count?: number
+  joined_count?: number
+}
+
+/** v0.5.0 群通话（SPEC §3.3）：服务端代理 Cloudflare SFU 的 SDP 载荷 */
+export interface SessionDescription {
+  type: string
+  sdp: string
+}
+
+export type TrackKind = 'audio' | 'video'
+
+export interface PublishedTrack {
+  track_name: string
+  kind: TrackKind
+  mid?: string
+}
+
+/** GET /api/calls/group/{call_id} 的 tracks 项（带发布者） */
+export interface GroupRoomTrack extends PublishedTrack {
+  user_id: number
+}
+
+export interface GroupCallJoinResult {
+  call_id: string
+  session_id: string
+  ice_servers: IceServers
+  participants: PublicUser[]
+}
+
+export interface GroupRoomState {
+  state: string
+  participants: PublicUser[]
+  tracks: GroupRoomTrack[]
+}
+
+/** publish / subscribe / close 的响应：透传 Cloudflare 的 sessionDescription 与重协商标记 */
+export interface TracksResponse {
+  session_description?: SessionDescription
+  requires_immediate_renegotiation?: boolean
+  tracks?: PublishedTrack[]
 }
 
 /** GET /api/calls/ice-servers 响应（SPEC §1.2） */
@@ -131,21 +210,21 @@ export interface Conversation {
   join_seq?: number
   unread: number
   updated_at: string
-  peer?: User
+  peer?: PublicUser
   last_message?: Message
   last_sender_name?: string
   name?: string
   owner_id?: number
   my_role?: number // 0 成员 1 管理员 2 群主
   member_count?: number
-  members_preview?: User[]
+  members_preview?: PublicUser[]
   announcement?: string
   announcement_by?: number
   announcement_at?: string
 }
 
 export interface Member {
-  user: User
+  user: PublicUser
   role: number
   read_seq: number
   joined_at: string
@@ -172,6 +251,9 @@ export interface ClientConfig {
   video_enabled?: boolean
   video_max_bytes?: number
   password_reset_enabled?: boolean
+  // v0.5.0（SPEC §3.1）：群通话（SFU）
+  group_call_enabled?: boolean
+  group_call_max_participants?: number
 }
 
 export interface AuthResult {

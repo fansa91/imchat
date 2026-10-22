@@ -71,8 +71,8 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
   }
 
   const nameOf = useCallback(
-    (uid: number) => (uid === me.id ? '你' : displayName(state.users[uid]) || '群成员'),
-    [state.users, me.id],
+    (uid: number) => (uid === me.id ? '你' : displayName(state.users[uid], state.friends[uid]?.remark) || '群成员'),
+    [state.users, state.friends, me.id],
   )
 
   const jumpTo = useCallback(
@@ -121,11 +121,15 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
   }
   const subtitle = typingOn
     ? isGroup
-      ? `${displayName(state.users[typing!.uid])} 正在输入…`
+      ? `${displayName(state.users[typing!.uid], state.friends[typing!.uid]?.remark)} 正在输入…`
       : '正在输入…'
     : isGroup
       ? `${conv?.member_count ?? ''} 位成员` + (presenceOn && groupOnline ? ` · ${groupOnline} 人在线` : '')
-      : (presenceOn && presenceText(peerPresence)) || conv?.peer?.email
+      : (presenceOn && presenceText(peerPresence)) || ''
+  const title = convTitle(conv, conv?.peer ? state.friends[conv.peer.id]?.remark : undefined)
+  // v0.5.0 群通话：本群进行中的房间（我不在里面时显示加入条）
+  const groupRoom = isGroup ? state.groupRooms[id] : undefined
+  const inThisCall = state.groupCall?.conversationId === id
 
   const attachOn = !!state.config.image_enabled || !!state.config.video_enabled || !!state.config.file_enabled
   /** kind 由 Composer 菜单指定；粘贴/拖入时省略，按 MIME 判断（图→图片、视频→视频、其余→文件） */
@@ -188,7 +192,7 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
         </md-icon-button>
         <ConvAvatar conv={conv} size={40} online={presenceOn && !!peerPresence?.online} />
         <div className="chat-title">
-          <div className="title-medium">{convTitle(conv)}</div>
+          <div className="title-medium">{title}</div>
           <div className={'body-small ' + (typingOn || (presenceOn && peerPresence?.online) ? 'accent' : 'muted')}>{subtitle}</div>
         </div>
         <div className="spacer" />
@@ -203,12 +207,31 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
             </md-icon-button>
           </>
         )}
+        {/* v0.5.0 群通话：群聊且服务端开启时显示；已有房间时改走下方加入条 */}
+        {isGroup && state.config.group_call_enabled && !groupRoom && (
+          <>
+            <md-icon-button aria-label="群语音通话" title="群语音通话" onClick={() => store.startGroupCall(id, 'audio')}>
+              <Icon name="call" />
+            </md-icon-button>
+            <md-icon-button aria-label="群视频通话" title="群视频通话" onClick={() => store.startGroupCall(id, 'video')}>
+              <Icon name="videocam" />
+            </md-icon-button>
+          </>
+        )}
         {isGroup && (
           <md-icon-button aria-label="群聊信息" onClick={onInfo}>
             <Icon name="info" />
           </md-icon-button>
         )}
       </header>
+
+      {isGroup && groupRoom && !inThisCall && (
+        <div className="gcall-bar" role="note">
+          <Icon name="call" size={20} />
+          <span className="ann-text">通话中 · {groupRoom.count} 人</span>
+          <md-filled-tonal-button onClick={() => store.joinGroupCall(id)}>加入</md-filled-tonal-button>
+        </div>
+      )}
 
       {showAnn && (
         <div className="announcement" role="note">
@@ -243,7 +266,7 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
         {thread?.loaded && all.length === 0 && (
           <div className="center grow muted">
             <ConvAvatar conv={conv} size={72} />
-            <p>和 {convTitle(conv)} 打个招呼吧</p>
+            <p>和 {title} 打个招呼吧</p>
           </div>
         )}
 

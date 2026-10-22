@@ -37,7 +37,7 @@ export function CallView({ state }: { state: State }) {
   if (!call) return null
   const conv = state.convs[call.conversationId]
   const peer = conv?.peer ?? state.users[call.peerId]
-  const peerName = conv ? convTitle(conv) : displayName(peer)
+  const peerName = conv ? convTitle(conv, conv.peer ? state.friends[conv.peer.id]?.remark : undefined) : displayName(peer, state.friends[call.peerId]?.remark)
   const isVideo = call.kind === 'video'
   const hasRemoteVideo = isVideo && !!call.remoteStream && call.remoteStream.getVideoTracks().length > 0
   const showStage = isVideo && (call.phase === 'connected' || call.phase === 'outgoing')

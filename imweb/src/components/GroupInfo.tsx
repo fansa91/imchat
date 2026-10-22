@@ -154,11 +154,12 @@ export function GroupInfoDialog({ open, onClose, state, id }: { open: boolean; o
                   <OnlineDot online={!!state.config.presence_enabled && !!state.presence[m.user.id]?.online} size={36}><Avatar user={m.user} size={36} /></OnlineDot>
                   <div className="member-main">
                     <div>
-                      {displayName(m.user)}
+                      {displayName(m.user, state.friends[m.user.id]?.remark)}
                       {isMe && <span className="muted">（你）</span>}
                       {m.role > 0 && <span className={'role-badge r' + m.role}>{ROLE[m.role]}</span>}
                     </div>
-                    <div className="body-small muted">{m.user.email}</div>
+                    {/* v0.5.0：群成员响应已收紧为 PublicUser，不再下发 email（SPEC §1.2） */}
+                    <div className="body-small muted">ID：{m.user.id}</div>
                   </div>
                   {(canRemove || canRole) && (
                     <md-icon-button aria-label={`管理 ${displayName(m.user)}`} onClick={() => setOpenRow(openRow === m.user.id ? null : m.user.id)}>

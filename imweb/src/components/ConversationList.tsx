@@ -9,13 +9,11 @@ export function ConversationList({
   activeId,
   onOpen,
   onNew,
-  onSettings,
 }: {
   state: State
   activeId: number | null
   onOpen: (id: number) => void
   onNew: () => void
-  onSettings: () => void
 }) {
   const list = Object.values(state.convs).sort(
     (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
@@ -25,10 +23,6 @@ export function ConversationList({
     <section className="pane list-pane">
       <header className="top-bar">
         <h1 className="title-large">消息</h1>
-        <div className="spacer" />
-        <md-icon-button aria-label="主题与账号" onClick={onSettings}>
-          <Icon name="palette" />
-        </md-icon-button>
       </header>
       {state.conn !== 'online' && (
         <div className="conn-banner">
@@ -54,6 +48,8 @@ export function ConversationList({
                 online={c.type !== 2 && !!c.peer && !!state.presence[c.peer.id]?.online}
                 meId={state.me?.id}
                 users={state.users}
+                friends={state.friends}
+                groupRoom={state.groupRooms[c.id]}
                 onOpen={onOpen}
               />
             ))}
@@ -75,6 +71,8 @@ function ConvItem({
   online,
   meId,
   users,
+  friends,
+  groupRoom,
   onOpen,
 }: {
   c: Conversation
@@ -83,14 +81,17 @@ function ConvItem({
   online: boolean
   meId?: number
   users: State['users']
+  friends: State['friends']
+  groupRoom?: State['groupRooms'][number]
   onOpen: (id: number) => void
 }) {
-  const name = convTitle(c)
+  const name = convTitle(c, c.peer ? friends[c.peer.id]?.remark : undefined)
   const last = c.last_message
   const senderName = (id: number) =>
-    users[id] ? displayName(users[id]) : id === last?.sender_id && c.last_sender_name ? c.last_sender_name : '群成员'
+    users[id] ? displayName(users[id], friends[id]?.remark) : id === last?.sender_id && c.last_sender_name ? c.last_sender_name : '群成员'
   let preview = '开始聊天吧'
   if (typing) preview = '正在输入…'
+  else if (groupRoom) preview = `通话中 · ${groupRoom.count} 人，点击加入`
   else if (last) {
     const body = previewOf(last, meId, senderName)
     const plain = !last.recalled && last.msg_type !== 10
@@ -110,7 +111,7 @@ function ConvItem({
             <span className={'conv-time' + (c.unread ? ' accent' : '')}>{last ? listTime(last.created_at) : ''}</span>
           </div>
           <div className="conv-row">
-            <span className={'conv-preview' + (typing ? ' accent' : '') + (c.unread ? ' strong' : '')}>{preview}</span>
+            <span className={'conv-preview' + (typing || groupRoom ? ' accent' : '') + (c.unread ? ' strong' : '')}>{preview}</span>
             {c.unread > 0 && <span className="badge">{c.unread > 99 ? '99+' : c.unread}</span>}
           </div>
         </div>

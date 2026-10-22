@@ -16,6 +16,7 @@ declare module 'react' {
       'md-linear-progress': MdProps
       'md-outlined-text-field': MdProps
       'md-primary-tab': MdProps
+      'md-switch': MdProps
       'md-ripple': MdProps
       'md-tabs': MdProps
       'md-text-button': MdProps

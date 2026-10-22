@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { getToken } from '../api'
 import { avatarTone, displayName, initial } from '../util'
-import type { Conversation, User } from '../types'
+import type { Conversation, PublicUser } from '../types'
 
 /**
  * 头像图加载（v0.4.0，SPEC §3.1）：user.avatar_url 是站内相对路径
@@ -25,7 +25,7 @@ function avatarObjectUrl(url: string): Promise<string> {
   return p
 }
 
-export function Avatar({ user, size = 40 }: { user?: User; size?: number }) {
+export function Avatar({ user, size = 40 }: { user?: PublicUser; size?: number }) {
   const tone = avatarTone(user?.id)
   const raw = user?.avatar_url || ''
   const [img, setImg] = useState<string | null>(null)
@@ -65,7 +65,7 @@ export function Avatar({ user, size = 40 }: { user?: User; size?: number }) {
 }
 
 /** 群头像：最多 4 个成员首字拼成九宫格（2x2），不足时 2 人左右排、3 人品字形 */
-export function GroupAvatar({ users, size = 40 }: { users: User[]; size?: number }) {
+export function GroupAvatar({ users, size = 40 }: { users: PublicUser[]; size?: number }) {
   const list = users.slice(0, 4)
   const n = Math.max(1, list.length)
   const cell = n === 1 ? size : size / 2

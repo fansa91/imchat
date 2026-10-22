@@ -17,7 +17,7 @@ export interface ItemProps {
   first: boolean
   last: boolean
   senderName: string
-  senderUser?: import('../types').User
+  senderUser?: import('../types').PublicUser
   replyName: string
   replyOrig?: Message
   voiceState?: VoiceState

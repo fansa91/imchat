@@ -1,4 +1,21 @@
-import type { AuthResult, ClientConfig, Conversation, IceServers, Member, Message, Presence, User } from './types'
+import type {
+  AuthResult,
+  ClientConfig,
+  Conversation,
+  FriendEntry,
+  FriendRequests,
+  GroupCallJoinResult,
+  GroupRoomState,
+  IceServers,
+  Member,
+  Message,
+  Presence,
+  SessionDescription,
+  TrackKind,
+  TracksResponse,
+  User,
+  UserSearchResult,
+} from './types'
 
 export class ApiError extends Error {
   constructor(public status: number, public code: string, message: string) {
@@ -46,7 +63,9 @@ export const api = {
     req<AuthResult>('POST', '/api/register', { email, password, nickname }),
   login: (email: string, password: string) => req<AuthResult>('POST', '/api/login', { email, password }),
   me: () => req<User>('GET', '/api/me'),
-  searchUser: (email: string) => req<User>('GET', `/api/users/search?email=${encodeURIComponent(email)}`),
+  // v0.5.0：搜索返回 PublicUser + relation，且不再含 email（SPEC §1.2/§1.3）
+  searchUser: (email: string) => req<UserSearchResult>('GET', `/api/users/search?email=${encodeURIComponent(email)}`),
+  searchUserById: (id: number) => req<UserSearchResult>('GET', `/api/users/search?id=${id}`),
   openDirect: (peerId: number) => req<{ conversation_id: number }>('POST', '/api/conversations/direct', { peer_id: peerId }),
   conversations: () => req<Conversation[]>('GET', '/api/conversations'),
   messages: (cid: number, opts: { after?: number; before?: number; changedSince?: number; limit?: number }) => {
@@ -85,13 +104,38 @@ export const api = {
   presence: (ids: number[]) => req<Presence[]>('GET', `/api/presence?ids=${ids.join(',')}`),
   transcribe: (cid: number, seq: number) =>
     req<{ text: string; cached: boolean }>('POST', `/api/conversations/${cid}/messages/${seq}/transcribe`),
-  // v0.4.0
-  patchMe: (patch: { nickname?: string; avatar_key?: string }) => req<User>('PATCH', '/api/me', patch),
+  // v0.4.0（allow_find 为 v0.5.0 新增，SPEC §2.1）
+  patchMe: (patch: { nickname?: string; avatar_key?: string; allow_find?: boolean }) => req<User>('PATCH', '/api/me', patch),
   changePassword: (oldPassword: string, newPassword: string) =>
     req<AuthResult>('POST', '/api/me/password', { old_password: oldPassword, new_password: newPassword }),
   forgotPassword: (email: string) => req<{ ok: boolean }>('POST', '/api/password/forgot', { email }),
   resetPassword: (token: string, newPassword: string) => req<{ ok: boolean }>('POST', '/api/password/reset', { token, new_password: newPassword }),
   getIceServers: () => req<IceServers>('GET', '/api/calls/ice-servers'),
+  // v0.5.0：退出其他设备——服务端 token_version+1 并给当前设备换发新 token（SPEC §2.1）
+  revokeOtherSessions: () => req<{ token: string }>('POST', '/api/me/revoke-other-sessions'),
+  // v0.5.0 好友（SPEC §1.3）
+  friends: () => req<FriendEntry[]>('GET', '/api/friends'),
+  friendRequests: () => req<FriendRequests>('GET', '/api/friends/requests'),
+  sendFriendRequest: (userId: number, message?: string) =>
+    req<{ id?: number; status: string }>('POST', '/api/friends/requests', { user_id: userId, ...(message ? { message } : {}) }),
+  acceptFriendRequest: (id: number) => req<{ ok: boolean }>('POST', `/api/friends/requests/${id}/accept`),
+  rejectFriendRequest: (id: number) => req<{ ok: boolean }>('POST', `/api/friends/requests/${id}/reject`),
+  cancelFriendRequest: (id: number) => req<{ ok: boolean }>('DELETE', `/api/friends/requests/${id}`),
+  patchFriend: (userId: number, remark: string) => req<{ ok: boolean }>('PATCH', `/api/friends/${userId}`, { remark }),
+  removeFriend: (userId: number) => req<{ ok: boolean }>('DELETE', `/api/friends/${userId}`),
+  // v0.5.0 群通话：服务端代理 Cloudflare SFU（SPEC §3.3）
+  createGroupCall: (conversationId: number, kind: 'audio' | 'video') =>
+    req<GroupCallJoinResult>('POST', '/api/calls/group', { conversation_id: conversationId, kind }),
+  joinGroupCall: (callId: string) => req<GroupCallJoinResult>('POST', `/api/calls/group/${callId}/join`),
+  publishTracks: (callId: string, body: { session_description: SessionDescription; tracks: { track_name: string; kind: TrackKind }[] }) =>
+    req<TracksResponse>('POST', `/api/calls/group/${callId}/tracks/publish`, body),
+  subscribeTracks: (callId: string, body: { tracks: { owner_id: number; kind: TrackKind }[]; session_description?: SessionDescription }) =>
+    req<TracksResponse>('POST', `/api/calls/group/${callId}/tracks/subscribe`, body),
+  renegotiateGroupCall: (callId: string, sessionDescription: SessionDescription) =>
+    req<TracksResponse>('POST', `/api/calls/group/${callId}/renegotiate`, { session_description: sessionDescription }),
+  closeTracks: (callId: string, kinds: TrackKind[]) => req<TracksResponse>('POST', `/api/calls/group/${callId}/tracks/close`, { kinds }),
+  leaveGroupCall: (callId: string) => req<{ ok: boolean }>('POST', `/api/calls/group/${callId}/leave`),
+  groupCallRoom: (callId: string) => req<GroupRoomState>('GET', `/api/calls/group/${callId}`),
 }
 
 /**

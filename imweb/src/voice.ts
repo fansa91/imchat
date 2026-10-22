@@ -55,7 +55,13 @@ function kv<V>(store: StoreName) {
     put: (k: string, v: V) => tx(store, 'readwrite', (s) => s.put(v, k)),
     del: (k: string) => tx(store, 'readwrite', (s) => s.delete(k)),
     has: (k: string) => tx<number>(store, 'readonly', (s) => s.count(k)).then((n) => n > 0),
+    clear: () => tx(store, 'readwrite', (s) => s.clear() as IDBRequest<undefined>),
   }
+}
+
+/** v0.5.0「我的 → 存储」：清空全部本地媒体缓存（语音 / 图片 / 转文字） */
+export async function clearMediaCaches() {
+  await Promise.all([voiceDB.clear(), imageDB.clear(), transcriptDB.clear()])
 }
 
 export const voiceDB = kv<Blob>('voice')

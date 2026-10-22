@@ -1,4 +1,4 @@
-import type { CallContent, Conversation, Message, SystemContent, User } from './types'
+import type { CallContent, Conversation, Message, SystemContent } from './types'
 
 const pad = (n: number) => String(n).padStart(2, '0')
 const sameDay = (a: Date, b: Date) => a.toDateString() === b.toDateString()
@@ -29,7 +29,13 @@ export function dayLabel(iso: string) {
   return /^\d{2}:\d{2}$/.test(t) ? `今天 ${hm(iso)}` : `${t} ${hm(iso)}`
 }
 
-export const displayName = (u?: User) => u?.nickname || u?.email?.split('@')[0] || '未知用户'
+/**
+ * 显示名（v0.5.0 全局统一规则，SPEC §1.4）：好友备注优先，其次昵称，
+ * 再退邮箱前缀。remark 传我给该用户的备注（state.friends[id]?.remark），
+ * 非好友或无备注时不传。
+ */
+export const displayName = (u?: { nickname?: string; email?: string } | null, remark?: string) =>
+  remark?.trim() || u?.nickname || u?.email?.split('@')[0] || '未知用户'
 
 export function initial(name: string) {
   const ch = [...name.trim()][0] || '?'
@@ -42,7 +48,9 @@ export function avatarTone(id = 0) {
 }
 
 
-export const convTitle = (c?: Conversation) => (c?.type === 2 ? c.name || '群聊' : displayName(c?.peer))
+/** 会话标题：群聊用群名；单聊用对端显示名（peerRemark = 我给对端的备注） */
+export const convTitle = (c?: Conversation, peerRemark?: string) =>
+  c?.type === 2 ? c.name || '群聊' : displayName(c?.peer, peerRemark)
 
 /** 系统消息文本：把自己替换成“你” */
 export function systemText(m: Message, meId?: number) {
@@ -100,6 +108,7 @@ export function shortPreview(msgType: number, content: string) {
   if (msgType === 6) {
     try {
       const c = JSON.parse(content) as CallContent
+      if (c.mode === 'group') return '[群通话]'
       return c.kind === 'video' ? '[视频通话]' : '[语音通话]'
     } catch {
       return '[通话]'
@@ -142,6 +151,19 @@ export function callText(content: string, meId?: number): string {
   }
   const label = c.kind === 'video' ? '视频通话' : '语音通话'
   const iAmCaller = c.caller_id === meId
+  // v0.5.0 群通话记录（SPEC §3.5）
+  if (c.mode === 'group') {
+    switch (c.outcome) {
+      case 'completed':
+        return `群${label} ${fmtCallDuration(c.duration_ms)}${c.joined_count ? ` · ${c.joined_count} 人参加` : ''}`
+      case 'missed':
+        return iAmCaller ? '群通话 · 无人加入' : '群通话 · 未加入'
+      case 'failed':
+        return '群通话失败'
+      default:
+        return `群${label}`
+    }
+  }
   switch (c.outcome) {
     case 'completed':
       return `${label} ${fmtCallDuration(c.duration_ms)}`
