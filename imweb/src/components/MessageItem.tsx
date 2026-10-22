@@ -1,12 +1,14 @@
 import { memo, useRef } from 'react'
 import { store, type Transcript, type VoiceState } from '../store'
 import type { Message, Reaction } from '../types'
-import { MSG_IMAGE, MSG_SYSTEM, MSG_TEXT, MSG_VOICE } from '../types'
+import { MSG_CALL, MSG_FILE, MSG_IMAGE, MSG_SYSTEM, MSG_TEXT, MSG_VIDEO, MSG_VOICE } from '../types'
 import { Avatar } from './Avatar'
 import { VoiceBubble } from './VoiceBubble'
 import { ImageBubble } from './ImageBubble'
+import { VideoBubble } from './VideoBubble'
+import { FileBubble } from './FileBubble'
 import { Icon } from '../icons'
-import { hm, shortPreview, systemText, UNSUPPORTED } from '../util'
+import { callText, hm, shortPreview, systemText, UNSUPPORTED } from '../util'
 
 export interface ItemProps {
   m: Message
@@ -32,27 +34,6 @@ export const MessageItem = memo(function MessageItem(p: ItemProps) {
   const bubbleRef = useRef<HTMLDivElement>(null)
   const press = useRef<{ t: number; x: number; y: number } | null>(null)
 
-  if (m.msg_type === MSG_SYSTEM) {
-    return (
-      <div className="sys-line" id={`msg-${m.conversation_id}-${m.seq}`}>
-        {systemText(m, meId)}
-      </div>
-    )
-  }
-  if (m.recalled) {
-    const draft = mine ? store.recalledDrafts.get(`${m.conversation_id}:${m.seq}`) : undefined
-    return (
-      <div className="sys-line recalled-line" id={`msg-${m.conversation_id}-${m.seq}`} data-recalled="1">
-        {mine ? '你' : p.senderName}撤回了一条消息
-        {draft !== undefined && (
-          <button className="link-btn" onClick={() => p.onReedit(draft)}>
-            重新编辑
-          </button>
-        )}
-      </div>
-    )
-  }
-
   const openMenu = () => {
     const r = bubbleRef.current?.getBoundingClientRect()
     if (r) p.onMenu(m, r)
@@ -73,11 +54,64 @@ export const MessageItem = memo(function MessageItem(p: ItemProps) {
     clearTimeout(press.current.t)
     press.current = null
   }
+  const menuHandlers = {
+    onContextMenu: (e: React.MouseEvent) => {
+      e.preventDefault()
+      openMenu()
+    },
+    onPointerDown,
+    onPointerUp: () => cancelPress(),
+    onPointerCancel: () => cancelPress(),
+    onPointerMove: cancelPress,
+  }
+
+  if (m.msg_type === MSG_SYSTEM) {
+    return (
+      <div className="sys-line" id={`msg-${m.conversation_id}-${m.seq}`}>
+        {systemText(m, meId)}
+      </div>
+    )
+  }
+  if (m.recalled) {
+    const draft = mine ? store.recalledDrafts.get(`${m.conversation_id}:${m.seq}`) : undefined
+    return (
+      <div className="sys-line recalled-line" id={`msg-${m.conversation_id}-${m.seq}`} data-recalled="1">
+        {mine ? '你' : p.senderName}撤回了一条消息
+        {draft !== undefined && (
+          <button className="link-btn" onClick={() => p.onReedit(draft)}>
+            重新编辑
+          </button>
+        )}
+      </div>
+    )
+  }
+  // v0.4.0 通话记录：居中系统样式（与系统消息一致），可回应/删除，不可撤回/引用（菜单里处理）
+  if (m.msg_type === MSG_CALL) {
+    let kind: string | undefined
+    try {
+      kind = JSON.parse(m.content).kind
+    } catch {}
+    return (
+      <div className="call-line-wrap" id={`msg-${m.conversation_id}-${m.seq}`}>
+        <div ref={bubbleRef} className="sys-line call-line" title={hm(m.created_at)} {...menuHandlers}>
+          <Icon name={kind === 'video' ? 'videocam' : 'call'} size={14} />
+          {callText(m.content, meId)}
+        </div>
+        {!!m.reactions?.length && (
+          <div className="call-reactions">
+            <Reactions m={m} list={m.reactions} meId={meId} />
+          </div>
+        )}
+      </div>
+    )
+  }
 
   const reply = m.reply_to
   const origRecalled = p.replyOrig ? !!p.replyOrig.recalled : !!reply?.recalled
   const origPreview = p.replyOrig ? shortPreview(p.replyOrig.msg_type, p.replyOrig.content) : reply?.preview
   const isImage = m.msg_type === MSG_IMAGE
+  const isVideo = m.msg_type === MSG_VIDEO
+  const isFile = m.msg_type === MSG_FILE
 
   return (
     <div
@@ -96,16 +130,17 @@ export const MessageItem = memo(function MessageItem(p: ItemProps) {
           )}
           <div
             ref={bubbleRef}
-            className={'bubble' + (m.status === 'sending' ? ' sending' : '') + (m.msg_type === MSG_VOICE ? ' voice' : '') + (isImage ? ' image' : '') + (isImage && reply ? ' with-quote' : '')}
+            className={
+              'bubble' +
+              (m.status === 'sending' ? ' sending' : '') +
+              (m.msg_type === MSG_VOICE ? ' voice' : '') +
+              (isImage ? ' image' : '') +
+              (isVideo ? ' video' : '') +
+              (isFile ? ' file' : '') +
+              ((isImage || isVideo) && reply ? ' with-quote' : '')
+            }
             title={hm(m.created_at)}
-            onContextMenu={(e) => {
-              e.preventDefault()
-              openMenu()
-            }}
-            onPointerDown={onPointerDown}
-            onPointerUp={() => cancelPress()}
-            onPointerCancel={() => cancelPress()}
-            onPointerMove={cancelPress}
+            {...menuHandlers}
           >
             {reply && (
               <button className="quote" onClick={(e) => (e.stopPropagation(), p.onJump(reply.seq))} title="跳到原消息">
@@ -117,6 +152,10 @@ export const MessageItem = memo(function MessageItem(p: ItemProps) {
               <VoiceBubble m={m} state={p.voiceState} />
             ) : isImage ? (
               <ImageBubble m={m} />
+            ) : isVideo ? (
+              <VideoBubble m={m} />
+            ) : isFile ? (
+              <FileBubble m={m} />
             ) : m.msg_type === MSG_TEXT ? (
               m.content
             ) : (

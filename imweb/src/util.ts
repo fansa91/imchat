@@ -1,4 +1,4 @@
-import type { Conversation, Message, SystemContent, User } from './types'
+import type { CallContent, Conversation, Message, SystemContent, User } from './types'
 
 const pad = (n: number) => String(n).padStart(2, '0')
 const sameDay = (a: Date, b: Date) => a.toDateString() === b.toDateString()
@@ -88,7 +88,76 @@ export function shortPreview(msgType: number, content: string) {
   if (msgType === 1) return content
   if (msgType === 2) return '[图片]'
   if (msgType === 3) return '[语音]'
+  if (msgType === 4) return '[视频]'
+  if (msgType === 5) {
+    // v0.4.0：文件预览带文件名（服务端 PreviewText 只有“[文件]”，客户端自行拼）
+    try {
+      const name = (JSON.parse(content) as { name?: string }).name
+      if (name) return `[文件] ${name}`
+    } catch {}
+    return '[文件]'
+  }
+  if (msgType === 6) {
+    try {
+      const c = JSON.parse(content) as CallContent
+      return c.kind === 'video' ? '[视频通话]' : '[语音通话]'
+    } catch {
+      return '[通话]'
+    }
+  }
   return UNSUPPORTED
+}
+
+/** 文件大小：B / KB / MB，保留一位小数（去掉末尾 .0） */
+export function fmtSize(bytes: number) {
+  if (!bytes || bytes < 0) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB']
+  let v = bytes / 1024
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i++
+  }
+  return `${Math.round(v * 10) / 10} ${units[i]}`
+}
+
+/** mm:ss（超过 1 小时显示 h:mm:ss），通话时长用 */
+export function fmtCallDuration(ms: number) {
+  const s = Math.max(0, Math.round(ms / 1000))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  const mm = h ? String(m).padStart(2, '0') : String(m)
+  return `${h ? h + ':' : ''}${mm}:${String(sec).padStart(2, '0')}`
+}
+
+/** 通话记录消息的展示文案（SPEC §1.4），meId 用于区分主叫/被叫视角 */
+export function callText(content: string, meId?: number): string {
+  let c: CallContent
+  try {
+    c = JSON.parse(content)
+  } catch {
+    return '[通话]'
+  }
+  const label = c.kind === 'video' ? '视频通话' : '语音通话'
+  const iAmCaller = c.caller_id === meId
+  switch (c.outcome) {
+    case 'completed':
+      return `${label} ${fmtCallDuration(c.duration_ms)}`
+    case 'missed':
+      return iAmCaller ? '对方未接听' : '未接听'
+    case 'rejected':
+      return iAmCaller ? '对方已拒绝' : '已拒绝'
+    case 'cancelled':
+      return iAmCaller ? '已取消' : '对方已取消'
+    case 'busy':
+      return '对方忙线'
+    case 'failed':
+      return '通话失败'
+    default:
+      return label
+  }
 }
 
 /** 在线状态文字：“在线” / “最后在线 今天 14:03” */

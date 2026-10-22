@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { store } from '../store'
 import type { Message } from '../types'
-import { MSG_TEXT, MSG_VOICE } from '../types'
+import { MSG_CALL, MSG_TEXT, MSG_VOICE } from '../types'
 import { Icon } from '../icons'
 
 /** 长按（手机，底部弹出）/ 悬停按钮、右键（桌面，气泡旁浮层）的消息菜单 */
@@ -87,9 +87,12 @@ export function MessageMenu({
           </form>
         )}
         <div className="menu-actions">
-          <button role="menuitem" onClick={act(() => onReply(m))}>
-            <Icon name="reply" size={20} /> 回复
-          </button>
+          {/* 通话记录不可引用回复、不可撤回（SPEC §1.4）：不显示回复，撤回由 canRecall 排除 */}
+          {m.msg_type !== MSG_CALL && (
+            <button role="menuitem" onClick={act(() => onReply(m))}>
+              <Icon name="reply" size={20} /> 回复
+            </button>
+          )}
           {m.msg_type === MSG_TEXT && (
             <button
               role="menuitem"

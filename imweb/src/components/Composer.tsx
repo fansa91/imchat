@@ -22,7 +22,8 @@ export const Composer = forwardRef<ComposerHandle, {
   replyName: string
   onCancelReply: () => void
   onSent: () => void
-  onFiles: (files: File[]) => void
+  /** kind 省略时由上层按文件类型判断（粘贴/拖入）；菜单里选的按 kind 发送 */
+  onFiles: (files: File[], kind?: 'image' | 'video' | 'file') => void
 }>(function Composer({ id, replyTo, replyName, onCancelReply, onSent, onFiles }, ref) {
   const [text, setText] = useState(() => drafts.get(id) ?? '')
   const input = useRef<HTMLTextAreaElement>(null)
@@ -32,6 +33,9 @@ export const Composer = forwardRef<ComposerHandle, {
   const recorder = useRef<Recorder | null>(null)
   const hold = useRef<{ start: number; x: number } | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
+  const videoInput = useRef<HTMLInputElement>(null)
+  const anyInput = useRef<HTMLInputElement>(null)
+  const [attachOpen, setAttachOpen] = useState(false)
   const tapModeAt = useRef(0) // 进入点按录音模式的时间，用于忽略同一次点按产生的“幽灵点击”
 
   useImperativeHandle(ref, () => ({
@@ -147,11 +151,54 @@ export const Composer = forwardRef<ComposerHandle, {
         </div>
       )}
       <div className="composer">
-        {cfg.image_enabled && !rec && (
-          <>
-            <md-icon-button class="image-btn" aria-label="发送图片" title="发送图片（也可粘贴或拖入）" onClick={() => fileInput.current?.click()}>
-              <Icon name="image" />
+        {(cfg.image_enabled || cfg.video_enabled || cfg.file_enabled) && !rec && (
+          <div className="attach-wrap">
+            <md-icon-button class="image-btn" aria-label="发送附件" title="发送图片 / 视频 / 文件（图片也可粘贴或拖入）" onClick={() => setAttachOpen((o) => !o)}>
+              <Icon name="add" />
             </md-icon-button>
+            {attachOpen && (
+              <>
+                <div className="attach-scrim" onClick={() => setAttachOpen(false)} />
+                <div className="attach-menu" role="menu">
+                  {cfg.image_enabled && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAttachOpen(false)
+                        fileInput.current?.click()
+                      }}
+                    >
+                      <Icon name="image" size={20} /> 图片
+                    </button>
+                  )}
+                  {cfg.video_enabled && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAttachOpen(false)
+                        videoInput.current?.click()
+                      }}
+                    >
+                      <Icon name="movie" size={20} /> 视频
+                    </button>
+                  )}
+                  {cfg.file_enabled && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setAttachOpen(false)
+                        anyInput.current?.click()
+                      }}
+                    >
+                      <Icon name="folder" size={20} /> 文件
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
             <input
               ref={fileInput}
               type="file"
@@ -161,10 +208,31 @@ export const Composer = forwardRef<ComposerHandle, {
               onChange={(e) => {
                 const files = [...(e.target.files ?? [])]
                 e.target.value = ''
-                if (files.length) onFiles(files)
+                if (files.length) onFiles(files, 'image')
               }}
             />
-          </>
+            <input
+              ref={videoInput}
+              type="file"
+              accept="video/mp4,video/webm,video/quicktime,video/*"
+              hidden
+              onChange={(e) => {
+                const files = [...(e.target.files ?? [])]
+                e.target.value = ''
+                if (files.length) onFiles(files, 'video')
+              }}
+            />
+            <input
+              ref={anyInput}
+              type="file"
+              hidden
+              onChange={(e) => {
+                const files = [...(e.target.files ?? [])]
+                e.target.value = ''
+                if (files.length) onFiles(files, 'file')
+              }}
+            />
+          </div>
         )}
         {rec ? (
           <div className={'recording' + (rec.cancelHint ? ' cancel' : '')} aria-live="polite">

@@ -1,4 +1,6 @@
-# imweb v0.3.0
+# imweb v0.4.0
+
+**v0.4.0 新增**：1 对 1 音视频通话（WebRTC P2P + Cloudflare TURN，信令走现有 WebSocket；单聊标题栏发起，来电全屏层与通话记录消息；无离线推送，对方不在线打不通）、文件/视频消息（输入栏 + 菜单发送，预签名直传带进度可取消，视频截首帧封面、全屏播放，文件点击下载）、头像/昵称编辑（设置里更换头像与昵称，头像走鉴权下发）、重置密码（登录页“忘记密码”、公开页 `/reset-password`）与设置里修改密码（修改后其他设备登录被吊销）。服务端 `/api/config` 没有 `call_enabled` / `file_enabled` / `video_enabled` 时自动隐藏对应功能。
 
 **v0.3.0 新增**：图片消息（选择 / 粘贴 / 拖入，本地压缩到长边 2048 JPEG 0.85，GIF 原样；全屏查看与保存；IndexedDB 永久缓存）、在线状态（单聊“在线 / 最后在线”、头像绿点、群聊“N 人在线”）、语音转文字（右键 / 长按“转文字”，结果本地缓存）。服务端 `/api/config` 没有 `image_enabled` / `presence_enabled` / `stt_enabled` 时自动隐藏对应功能；未知消息类型显示“[不支持的消息，请升级]”。
 
@@ -51,6 +53,8 @@ IM_SERVER=http://127.0.0.1:8092 npx vite preview --port 4173
 src/api.ts                HTTP 接口
 src/socket.ts             WebSocket：自动重连、心跳
 src/store.ts              状态：会话、消息、发送队列、已读、离线补拉、群成员、撤回/回应/删除、语音上传下载
+src/call.ts               通话状态机（WebRTC + 信令），UI 状态同步到 store
+src/media.ts              视频元数据/截首帧、头像裁剪、文件名清洗
 src/voice.ts              录音（MediaRecorder + 波形）、IndexedDB 语音缓存
 src/theme.ts              Material You 动态配色（种子色 → --md-sys-color-*）
 src/components/
@@ -58,7 +62,11 @@ src/components/
   MessageItem.tsx         单条消息：气泡、引用、表情回应、系统消息、撤回墓碑、长按
   MessageMenu.tsx         消息菜单（桌面浮层 / 手机底部弹出）
   VoiceBubble.tsx         语音气泡（播放、波形进度、拖动跳转）
-  Composer.tsx            输入栏（文字 / 点按或按住录音）
+  VideoBubble.tsx         视频气泡（首帧、时长角标、全屏播放、上传进度）
+  FileBubble.tsx          文件气泡（图标/文件名/大小、点击下载、上传进度）
+  CallView.tsx            通话层（来电、通话中、计时、静音/关摄像头）
+  ResetPassword.tsx       公开重置密码页（/reset-password）
+  Composer.tsx            输入栏（文字 / 点按或按住录音 / 附件菜单）
   GroupInfo.tsx           群信息对话框
   ConversationList.tsx    会话列表（群头像、发送者前缀、撤回/系统消息预览）
   Dialogs.tsx             新建单聊/群聊、设置

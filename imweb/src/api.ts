@@ -1,4 +1,4 @@
-import type { AuthResult, ClientConfig, Conversation, Member, Message, Presence, User } from './types'
+import type { AuthResult, ClientConfig, Conversation, IceServers, Member, Message, Presence, User } from './types'
 
 export class ApiError extends Error {
   constructor(public status: number, public code: string, message: string) {
@@ -73,7 +73,11 @@ export const api = {
   presign: (
     body:
       | { kind: 'voice'; mime: string; size: number; duration_ms: number }
-      | { kind: 'image'; mime: string; size: number; width: number; height: number },
+      | { kind: 'image'; mime: string; size: number; width: number; height: number }
+      // v0.4.0
+      | { kind: 'video'; mime: string; size: number; duration_ms: number; width: number; height: number }
+      | { kind: 'file'; mime: string; size: number; name: string }
+      | { kind: 'avatar'; mime: string; size: number; width: number; height: number },
   ) =>
     req<{ key: string; url: string; method: string; headers: Record<string, string>; expires_at: string }>('POST', '/api/uploads/presign', body),
   media: (cid: number, seq: number) => req<{ url: string; mime: string; size: number }>('GET', `/api/conversations/${cid}/messages/${seq}/media`),
@@ -81,4 +85,36 @@ export const api = {
   presence: (ids: number[]) => req<Presence[]>('GET', `/api/presence?ids=${ids.join(',')}`),
   transcribe: (cid: number, seq: number) =>
     req<{ text: string; cached: boolean }>('POST', `/api/conversations/${cid}/messages/${seq}/transcribe`),
+  // v0.4.0
+  patchMe: (patch: { nickname?: string; avatar_key?: string }) => req<User>('PATCH', '/api/me', patch),
+  changePassword: (oldPassword: string, newPassword: string) =>
+    req<AuthResult>('POST', '/api/me/password', { old_password: oldPassword, new_password: newPassword }),
+  forgotPassword: (email: string) => req<{ ok: boolean }>('POST', '/api/password/forgot', { email }),
+  resetPassword: (token: string, newPassword: string) => req<{ ok: boolean }>('POST', '/api/password/reset', { token, new_password: newPassword }),
+  getIceServers: () => req<IceServers>('GET', '/api/calls/ice-servers'),
+}
+
+/**
+ * 带进度与取消的 PUT（预签名直传用，fetch 没有上传进度）。
+ * 返回的 promise 在 abort 后以 AbortError 拒绝，HTTP 非 2xx 时以普通 Error 拒绝。
+ */
+export function putWithProgress(
+  url: string,
+  headers: Record<string, string>,
+  body: Blob,
+  onProgress: (fraction: number) => void,
+): { promise: Promise<void>; abort: () => void } {
+  const xhr = new XMLHttpRequest()
+  const promise = new Promise<void>((resolve, reject) => {
+    xhr.open('PUT', url)
+    for (const [k, v] of Object.entries(headers)) xhr.setRequestHeader(k, v)
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(e.loaded / e.total)
+    }
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`上传失败 (${xhr.status})`)))
+    xhr.onerror = () => reject(new Error('网络连接失败'))
+    xhr.onabort = () => reject(new DOMException('aborted', 'AbortError'))
+    xhr.send(body)
+  })
+  return { promise, abort: () => xhr.abort() }
 }

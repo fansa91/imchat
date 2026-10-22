@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import { store } from './store'
 import { applyTheme, loadPrefs, onSystemThemeChange, savePrefs, type Mode } from './theme'
 import { Auth } from './components/Auth'
+import { CallView } from './components/CallView'
+import { ResetPasswordPage } from './components/ResetPassword'
 import { ConversationList } from './components/ConversationList'
 import { ChatView } from './components/ChatView'
 import { NewChatDialog, SettingsDialog } from './components/Dialogs'
@@ -53,6 +55,9 @@ export default function App() {
   const closeSettings = useCallback(() => setSettingsOpen(false), [])
   const closeInfo = useCallback(() => setInfoOpen(false), [])
 
+  // v0.4.0：公开重置密码页（邮件链接 /reset-password?token=...），无路由库，按 path 判断
+  if (location.pathname === '/reset-password') return <ResetPasswordPage />
+
   if (state.booting) {
     return (
       <div className="center full">
@@ -83,6 +88,7 @@ export default function App() {
           </div>
         </section>
       )}
+      <CallView state={state} />
       <GroupInfoDialog open={infoOpen && !!validActive} onClose={closeInfo} state={state} id={validActive} />
       {state.toast && (
         <div className="toast" role="status">

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { store, type State } from '../store'
 import type { Message } from '../types'
-import { MSG_SYSTEM } from '../types'
+import { MSG_CALL, MSG_SYSTEM } from '../types'
 import { ConvAvatar } from './Avatar'
 import { Composer, type ComposerHandle } from './Composer'
 import { MessageItem } from './MessageItem'
@@ -106,7 +106,7 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
 
   let lastMine = -1
   all.forEach((m, i) => {
-    if (m.sender_id === me.id && m.msg_type !== MSG_SYSTEM && !m.recalled) lastMine = i
+    if (m.sender_id === me.id && m.msg_type !== MSG_SYSTEM && m.msg_type !== MSG_CALL && !m.recalled) lastMine = i
   })
 
   // 在线状态（服务端 presence_enabled 时）
@@ -127,20 +127,25 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
       ? `${conv?.member_count ?? ''} 位成员` + (presenceOn && groupOnline ? ` · ${groupOnline} 人在线` : '')
       : (presenceOn && presenceText(peerPresence)) || conv?.peer?.email
 
-  const imageOn = !!state.config.image_enabled
+  const attachOn = !!state.config.image_enabled || !!state.config.video_enabled || !!state.config.file_enabled
+  /** kind 由 Composer 菜单指定；粘贴/拖入时省略，按 MIME 判断（图→图片、视频→视频、其余→文件） */
   const sendFiles = useCallback(
-    (files: File[]) => {
-      const imgs = files.filter((f) => f.type.startsWith('image/'))
-      if (!imgs.length) return store.showToast('只能发送图片')
+    (files: File[], kind?: 'image' | 'video' | 'file') => {
+      if (!files.length) return
       const reply = replyTo?.seq
-      for (const f of imgs.slice(0, 9)) store.sendImage(id, f, reply)
-      if (imgs.length > 9) store.showToast('一次最多发送 9 张图片')
+      for (const f of files.slice(0, 9)) {
+        const k = kind ?? (f.type.startsWith('image/') ? 'image' : f.type.startsWith('video/') ? 'video' : 'file')
+        if (k === 'image') store.sendImage(id, f, reply)
+        else if (k === 'video') store.sendVideo(id, f, reply)
+        else store.sendFile(id, f, reply)
+      }
+      if (files.length > 9) store.showToast('一次最多发送 9 个')
       setReplyTo(null)
       stickBottom.current = true
     },
     [id, replyTo],
   )
-  const hasFiles = (e: React.DragEvent) => imageOn && [...e.dataTransfer.types].includes('Files')
+  const hasFiles = (e: React.DragEvent) => attachOn && [...e.dataTransfer.types].includes('Files')
 
   const showAnn = isGroup && !!conv?.announcement && !annHidden
 
@@ -174,7 +179,7 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
       {dragging && (
         <div className="drop-overlay" aria-hidden="true">
           <Icon name="image" size={48} />
-          <span className="title-medium">松开发送图片</span>
+          <span className="title-medium">松开发送文件</span>
         </div>
       )}
       <header className="top-bar chat-bar">
@@ -187,6 +192,17 @@ export function ChatView({ state, id, onBack, onInfo }: { state: State; id: numb
           <div className={'body-small ' + (typingOn || (presenceOn && peerPresence?.online) ? 'accent' : 'muted')}>{subtitle}</div>
         </div>
         <div className="spacer" />
+        {/* v0.4.0 通话：仅单聊且服务端开启时显示；无离线推送，对方不在线打不通（服务端直接判 offline） */}
+        {!isGroup && state.config.call_enabled && (
+          <>
+            <md-icon-button aria-label="语音通话" title="语音通话（对方需在线）" onClick={() => store.startCall(id, 'audio')}>
+              <Icon name="call" />
+            </md-icon-button>
+            <md-icon-button aria-label="视频通话" title="视频通话（对方需在线）" onClick={() => store.startCall(id, 'video')}>
+              <Icon name="videocam" />
+            </md-icon-button>
+          </>
+        )}
         {isGroup && (
           <md-icon-button aria-label="群聊信息" onClick={onInfo}>
             <Icon name="info" />

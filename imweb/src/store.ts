@@ -1,9 +1,11 @@
-import { api, ApiError, getToken, setToken, setUnauthorizedHandler } from './api'
+import { api, ApiError, getToken, putWithProgress, setToken, setUnauthorizedHandler } from './api'
 import { Socket } from './socket'
-import { MSG_IMAGE, MSG_SYSTEM, MSG_TEXT, MSG_VOICE } from './types'
-import type { ClientConfig, Conversation, ImageContent, Member, Message, Presence, Reaction, SystemContent, User, VoiceContent } from './types'
+import { MSG_CALL, MSG_FILE, MSG_IMAGE, MSG_SYSTEM, MSG_TEXT, MSG_VIDEO, MSG_VOICE } from './types'
+import type { CallContent, ClientConfig, Conversation, FileContent, ImageContent, Member, Message, Presence, Reaction, SystemContent, User, VideoContent, VoiceContent } from './types'
 import { imageDB, requestPersist, transcriptDB, voiceDB, voiceKey, type Recording } from './voice'
 import { prepareImage } from './image'
+import { probeVideo, sanitizeFileName, videoMimeOf } from './media'
+import { CallManager, type CallUiState } from './call'
 import { shortPreview } from './util'
 
 export interface Thread {
@@ -45,6 +47,8 @@ export interface State {
   voice: Record<string, VoiceState> // voiceKey -> 状态
   presence: Record<number, Presence> // 用户 -> 在线状态
   transcripts: Record<string, Transcript> // voiceKey -> 转文字结果
+  call: CallUiState | null // v0.4.0：当前通话（无通话为 null）
+  notice: string // 退出到登录页时的一次性提示（如 session_revoked）
   toast: string
 }
 
@@ -75,6 +79,33 @@ export function parseVoice(m: Message): VoiceContent | null {
   }
 }
 
+export function parseVideo(m: Message): VideoContent | null {
+  if (m.msg_type !== MSG_VIDEO || m.recalled) return null
+  try {
+    return JSON.parse(m.content)
+  } catch {
+    return null
+  }
+}
+
+export function parseFile(m: Message): FileContent | null {
+  if (m.msg_type !== MSG_FILE || m.recalled) return null
+  try {
+    return JSON.parse(m.content)
+  } catch {
+    return null
+  }
+}
+
+export function parseCall(m: Message): CallContent | null {
+  if (m.msg_type !== MSG_CALL || m.recalled) return null
+  try {
+    return JSON.parse(m.content)
+  } catch {
+    return null
+  }
+}
+
 const initial = (): State => ({
   me: null,
   booting: true,
@@ -89,6 +120,8 @@ const initial = (): State => ({
   voice: {},
   presence: {},
   transcripts: {},
+  call: null,
+  notice: '',
   toast: '',
 })
 
@@ -104,6 +137,19 @@ class Store {
   private downloading = 0
   /** 进行中的图片加载（去重） */
   private imageLoads = new Map<string, Promise<string>>()
+  /** v0.4.0：视频封面 Blob（client_msg_id -> 截图），随视频一起上传 */
+  private posters = new Map<string, { blob: Blob; width: number; height: number }>()
+  /** v0.4.0：进行中的 PUT 上传（client_msg_id -> 可取消句柄） */
+  private uploads = new Map<string, { abort: () => void }>()
+  /** v0.4.0：通话状态机（信令走同一个 socket，UI 状态同步到 state.call） */
+  private callMgr = new CallManager({
+    send: (type, data) => this.socket.send(type, data),
+    getIce: () => api.getIceServers(),
+    onChange: (call) => this.set({ call }),
+    toast: (msg) => this.showToast(msg),
+    meId: () => this.state.me?.id,
+    ringSeconds: () => this.state.config.call_ring_timeout_seconds ?? 60,
+  })
   private configReady: Promise<void> = Promise.resolve()
   /** 自己撤回的文本，用于“重新编辑” */
   recalledDrafts = new Map<string, string>()
@@ -123,6 +169,21 @@ class Store {
     this.socket.on('conversation_updated', (d) => this.refreshConversation(d.conversation_id))
     this.socket.on('conversation_removed', (d) => this.dropConversation(d.conversation_id))
     this.socket.on('presence', (d: Presence) => this.applyPresence([d]))
+    // v0.4.0：通话信令转发给状态机；资料变更刷新用户缓存；登录被吊销回登录页
+    for (const t of ['call_invite', 'call_accept', 'call_reject', 'call_cancel', 'call_hangup', 'call_signal', 'call_unavailable']) {
+      this.socket.on(t, (d) => this.callMgr.handle(t, d))
+    }
+    this.socket.on('user_updated', (d) => this.onUserUpdated(d?.user))
+    this.socket.on('session_revoked', async () => {
+      // 若是本设备刚改完密码：本地已换上新 token，校验通过则不登出，
+      // socket 会在服务端断开后用新 token 自动重连（其他设备已被踢）。
+      try {
+        await api.me()
+        this.showToast('密码已修改，其他设备已退出登录')
+      } catch {
+        this.logout('你的登录已被撤销（密码已修改），请重新登录')
+      }
+    })
     this.socket.on('error', (d, id) => {
       if (id && this.timers.has(id)) this.failPending(id)
       else if (id) this.showToast(d?.message || '操作失败')
@@ -155,12 +216,33 @@ class Store {
     const users = { ...this.state.users }
     let changed = false
     for (const u of list) {
-      if (u && (!users[u.id] || users[u.id].nickname !== u.nickname)) {
+      if (u && (!users[u.id] || users[u.id].nickname !== u.nickname || users[u.id].avatar_url !== u.avatar_url)) {
         users[u.id] = u
         changed = true
       }
     }
     if (changed) this.set({ users })
+  }
+
+  /** v0.4.0：别人（或自己其他设备）改了昵称/头像 */
+  private onUserUpdated(u?: User) {
+    if (!u?.id) return
+    this.addUsers([u])
+    if (u.id === this.state.me?.id) this.set({ me: u })
+    // 会话列表里的 peer / members_preview 也换成新资料
+    const convs = { ...this.state.convs }
+    let touched = false
+    for (const c of Object.values(convs)) {
+      if (c.peer?.id === u.id) {
+        convs[c.id] = { ...c, peer: u }
+        touched = true
+      }
+      if (c.members_preview?.some((x) => x.id === u.id)) {
+        convs[c.id] = { ...convs[c.id], members_preview: c.members_preview.map((x) => (x.id === u.id ? u : x)) }
+        touched = true
+      }
+    }
+    if (touched) this.set({ convs })
   }
 
   private toastTimer = 0
@@ -202,7 +284,8 @@ class Store {
     this.afterLogin()
   }
 
-  logout() {
+  logout(notice = '') {
+    this.callMgr.dispose()
     this.socket.stop()
     setToken('')
     this.timers.forEach((t) => clearTimeout(t))
@@ -211,7 +294,10 @@ class Store {
     this.blobUrls.clear()
     this.blobs.clear()
     this.imageLoads.clear()
-    this.set({ ...initial(), booting: false })
+    this.posters.clear()
+    this.uploads.forEach((u) => u.abort())
+    this.uploads.clear()
+    this.set({ ...initial(), booting: false, notice })
   }
 
   async loadConversations() {
@@ -562,10 +648,48 @@ class Store {
     await this.uploadAndSend(m)
   }
 
+  /** 视频：读元数据/截首帧 → 先占位显示 → 预签名上传（封面按图片上传）→ WebSocket 发送 */
+  async sendVideo(id: number, file: File, replyToSeq?: number) {
+    if (!this.state.me) return
+    const cfg = this.state.config
+    if (!cfg.video_enabled) return this.showToast('服务器未开启视频消息')
+    const mime = videoMimeOf(file)
+    if (!['video/mp4', 'video/webm', 'video/quicktime'].includes(mime)) return this.showToast('只支持 MP4 / WebM / MOV 视频')
+    const max = cfg.video_max_bytes ?? 100 * 1024 * 1024
+    if (file.size > max) return this.showToast(`视频不能超过 ${Math.round((max / 1048576) * 10) / 10} MB`)
+    const meta = await probeVideo(file)
+    // 服务端默认 video_max_seconds=600（/api/config 未下发这个值，本地按默认值先拦）
+    if (meta.durationMs > 601 * 1000) return this.showToast('视频时长不能超过 10 分钟')
+    const local: VideoContent = { key: '', mime, size: file.size, duration_ms: meta.durationMs, width: meta.width, height: meta.height }
+    const m = this.addPending(id, MSG_VIDEO, JSON.stringify(local), replyToSeq)
+    this.blobs.set(m.client_msg_id, file)
+    if (meta.poster) this.posters.set(m.client_msg_id, meta.poster)
+    await this.uploadAndSend(m)
+  }
+
+  /** 文件：原样上传，文件名按服务端规则清洗 */
+  async sendFile(id: number, file: File, replyToSeq?: number) {
+    if (!this.state.me) return
+    const cfg = this.state.config
+    if (!cfg.file_enabled) return this.showToast('服务器未开启文件消息')
+    const max = cfg.file_max_bytes ?? 100 * 1024 * 1024
+    if (file.size > max) return this.showToast(`文件不能超过 ${Math.round((max / 1048576) * 10) / 10} MB`)
+    const local: FileContent = { key: '', mime: file.type || 'application/octet-stream', size: file.size, name: sanitizeFileName(file.name) }
+    const m = this.addPending(id, MSG_FILE, JSON.stringify(local), replyToSeq)
+    this.blobs.set(m.client_msg_id, file)
+    await this.uploadAndSend(m)
+  }
+
+  private patchProgress(m: Message, fraction: number) {
+    this.patchThread(m.conversation_id, (t) => ({
+      ...t,
+      pending: t.pending.map((p) => (p.client_msg_id === m.client_msg_id ? { ...p, progress: fraction } : p)),
+    }))
+  }
+
   private async uploadAndSend(m: Message) {
     const blob = this.blobs.get(m.client_msg_id)
-    const isImage = m.msg_type === MSG_IMAGE
-    let vc: VoiceContent & ImageContent
+    let vc: any
     try {
       vc = JSON.parse(m.content)
     } catch {
@@ -573,24 +697,42 @@ class Store {
     }
     if (!vc.key) {
       if (!blob) return this.failPending(m.client_msg_id)
+      const label = { [MSG_VOICE]: '语音', [MSG_IMAGE]: '图片', [MSG_VIDEO]: '视频', [MSG_FILE]: '文件' }[m.msg_type] ?? '文件'
       try {
-        const pre = await api.presign(
-          isImage
-            ? { kind: 'image', mime: vc.mime, size: blob.size, width: vc.width, height: vc.height }
-            : { kind: 'voice', mime: vc.mime, size: blob.size, duration_ms: vc.duration_ms },
-        )
-        const res = await fetch(pre.url, { method: 'PUT', headers: pre.headers, body: blob })
-        if (!res.ok) throw new Error(`上传失败 (${res.status})`)
+        // 视频封面先按图片上传，拿到 key 后写进 content.poster_key
+        const poster = this.posters.get(m.client_msg_id)
+        if (m.msg_type === MSG_VIDEO && poster && !vc.poster_key) {
+          const pre = await api.presign({ kind: 'image', mime: 'image/jpeg', size: poster.blob.size, width: poster.width, height: poster.height })
+          const up = putWithProgress(pre.url, pre.headers, poster.blob, () => {})
+          this.uploads.set(m.client_msg_id, up)
+          await up.promise
+          vc = { ...vc, poster_key: pre.key }
+        }
+        const body =
+          m.msg_type === MSG_IMAGE
+            ? { kind: 'image' as const, mime: vc.mime, size: blob.size, width: vc.width, height: vc.height }
+            : m.msg_type === MSG_VIDEO
+              ? { kind: 'video' as const, mime: vc.mime, size: blob.size, duration_ms: vc.duration_ms, width: vc.width, height: vc.height }
+              : m.msg_type === MSG_FILE
+                ? { kind: 'file' as const, mime: vc.mime, size: blob.size, name: vc.name }
+                : { kind: 'voice' as const, mime: vc.mime, size: blob.size, duration_ms: vc.duration_ms }
+        const pre = await api.presign(body)
+        const up = putWithProgress(pre.url, pre.headers, blob, (f) => this.patchProgress(m, f))
+        this.uploads.set(m.client_msg_id, up)
+        await up.promise
         vc = { ...vc, key: pre.key }
       } catch (e) {
-        this.showToast(e instanceof ApiError ? e.message : isImage ? '图片上传失败' : '语音上传失败')
+        if ((e as Error)?.name === 'AbortError') return // 用户已取消，pending 已移除
+        this.showToast(e instanceof ApiError ? e.message : `${label}上传失败`)
         return this.failPending(m.client_msg_id)
+      } finally {
+        this.uploads.delete(m.client_msg_id)
       }
       const content = JSON.stringify(vc)
       m = { ...m, content }
       this.patchThread(m.conversation_id, (t) => ({
         ...t,
-        pending: t.pending.map((p) => (p.client_msg_id === m.client_msg_id ? { ...p, content } : p)),
+        pending: t.pending.map((p) => (p.client_msg_id === m.client_msg_id ? { ...p, content, progress: undefined } : p)),
       }))
     }
     this.transmit(m)
@@ -601,14 +743,14 @@ class Store {
       ...t,
       pending: t.pending.map((p) => (p.client_msg_id === m.client_msg_id ? { ...p, status: 'sending' } : p)),
     }))
-    if (m.msg_type === MSG_VOICE || m.msg_type === MSG_IMAGE) this.uploadAndSend(m)
+    if (m.msg_type === MSG_VOICE || m.msg_type === MSG_IMAGE || m.msg_type === MSG_VIDEO || m.msg_type === MSG_FILE) this.uploadAndSend(m)
     else this.transmit(m)
   }
 
   /** 发出（或重发同一个 client_msg_id，服务端保证幂等） */
   private transmit(m: Message) {
     clearTimeout(this.timers.get(m.client_msg_id))
-    if (m.msg_type === MSG_VOICE || m.msg_type === MSG_IMAGE) {
+    if (m.msg_type === MSG_VOICE || m.msg_type === MSG_IMAGE || m.msg_type === MSG_VIDEO || m.msg_type === MSG_FILE) {
       try {
         if (!JSON.parse(m.content).key) return // 还没上传完
       } catch {}
@@ -635,10 +777,18 @@ class Store {
     }
   }
 
-  /** 删除本地发送失败的消息 */
+  /** 删除本地发送失败的消息；上传中则先中止 PUT（v0.4.0 文件/视频可取消） */
   discardPending(m: Message) {
     clearTimeout(this.timers.get(m.client_msg_id))
+    this.uploads.get(m.client_msg_id)?.abort()
+    this.uploads.delete(m.client_msg_id)
     this.blobs.delete(m.client_msg_id)
+    this.posters.delete(m.client_msg_id)
+    const u = this.blobUrls.get(m.client_msg_id)
+    if (u) {
+      URL.revokeObjectURL(u)
+      this.blobUrls.delete(m.client_msg_id)
+    }
     this.patchThread(m.conversation_id, (t) => ({ ...t, pending: t.pending.filter((p) => p.client_msg_id !== m.client_msg_id) }))
   }
 
@@ -653,6 +803,16 @@ class Store {
       this.blobs.set(k, blob)
       this.set({ voice: { ...this.state.voice, [k]: 'ready' } })
       voiceDB.put(k, blob).catch((e) => console.warn('save voice', e))
+    }
+    // 自己发的视频/文件不做本地永久缓存（太大），确认后释放 Blob 与预览 URL
+    if (blob && (m.msg_type === MSG_VIDEO || m.msg_type === MSG_FILE)) {
+      this.blobs.delete(m.client_msg_id)
+      this.posters.delete(m.client_msg_id)
+      const u = this.blobUrls.get(m.client_msg_id)
+      if (u) {
+        URL.revokeObjectURL(u)
+        this.blobUrls.delete(m.client_msg_id)
+      }
     }
     // 自己发的图片：压缩后的 Blob 直接存入 IndexedDB
     if (blob && m.msg_type === MSG_IMAGE) {
@@ -771,6 +931,7 @@ class Store {
       m.seq > 0 &&
       !m.recalled &&
       m.msg_type !== MSG_SYSTEM &&
+      m.msg_type !== MSG_CALL && // 通话记录不可撤回（SPEC §1.4，服务端也会拒）
       Date.now() - new Date(m.created_at).getTime() < this.state.config.recall_seconds * 1000 - 1500
     )
   }
@@ -1008,6 +1169,55 @@ class Store {
     const transcripts = { ...this.state.transcripts }
     delete transcripts[k]
     this.set({ transcripts })
+  }
+
+  // ---------- v0.4.0：本地媒体预览 / 资料 / 密码 / 通话 ----------
+
+  /** 待发送（未确认）媒体消息的本地预览 URL：只认内存 Blob，不落盘 */
+  localMediaUrl(m: Message): string | null {
+    const k = m.client_msg_id
+    if (this.blobUrls.has(k)) return this.blobUrls.get(k)!
+    const blob = this.blobs.get(k)
+    if (!blob) return null
+    const u = URL.createObjectURL(blob)
+    this.blobUrls.set(k, u)
+    return u
+  }
+
+  async updateProfile(patch: { nickname?: string; avatar_key?: string }) {
+    const user = await api.patchMe(patch)
+    this.set({ me: user, users: { ...this.state.users, [user.id]: user } })
+    return user
+  }
+
+  /** 已登录改密码：用服务端返回的新 token 无感续用（其他设备的旧 token 已被吊销） */
+  async changePassword(oldPassword: string, newPassword: string) {
+    const r = await api.changePassword(oldPassword, newPassword)
+    setToken(r.token)
+    this.set({ me: r.user, users: { ...this.state.users, [r.user.id]: r.user } })
+    return r
+  }
+
+  startCall(conversationId: number, kind: 'audio' | 'video') {
+    const conv = this.state.convs[conversationId]
+    if (!conv?.peer) return
+    if (!this.state.config.call_enabled) return this.showToast('服务器未开启通话')
+    void this.callMgr.start(conversationId, conv.peer.id, kind)
+  }
+  acceptCall() {
+    void this.callMgr.accept()
+  }
+  rejectCall() {
+    this.callMgr.reject()
+  }
+  hangupCall() {
+    this.callMgr.hangup()
+  }
+  toggleCallMute() {
+    this.callMgr.toggleMute()
+  }
+  toggleCallCamera() {
+    this.callMgr.toggleCamera()
   }
 }
 

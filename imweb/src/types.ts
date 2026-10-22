@@ -11,6 +11,9 @@ export type MsgStatus = 'sending' | 'failed' | 'sent'
 export const MSG_TEXT = 1
 export const MSG_IMAGE = 2
 export const MSG_VOICE = 3
+export const MSG_VIDEO = 4
+export const MSG_FILE = 5
+export const MSG_CALL = 6
 export const MSG_SYSTEM = 10
 
 export interface Reaction {
@@ -43,6 +46,8 @@ export interface Message {
   mod_seq?: number
   reactions?: Reaction[]
   status?: MsgStatus
+  /** v0.4.0：本地上传进度 0~1（仅 pending 的媒体消息用，不上送服务端） */
+  progress?: number
 }
 
 /** 语音消息 content（JSON） */
@@ -61,6 +66,43 @@ export interface ImageContent {
   size: number
   width: number
   height: number
+}
+
+/** 视频消息 content（JSON），v0.4.0（SPEC §2.2） */
+export interface VideoContent {
+  key: string
+  mime: string
+  size: number
+  duration_ms: number
+  width: number
+  height: number
+  poster_key?: string
+}
+
+/** 文件消息 content（JSON），v0.4.0（SPEC §2.2） */
+export interface FileContent {
+  key: string
+  mime: string
+  size: number
+  name: string
+}
+
+export type CallKind = 'audio' | 'video'
+export type CallOutcome = 'completed' | 'missed' | 'rejected' | 'cancelled' | 'busy' | 'failed'
+
+/** 通话记录消息 content（JSON），v0.4.0（SPEC §1.4），只能由服务端生成 */
+export interface CallContent {
+  call_id: string
+  kind: CallKind
+  outcome: CallOutcome
+  duration_ms: number
+  caller_id: number
+}
+
+/** GET /api/calls/ice-servers 响应（SPEC §1.2） */
+export interface IceServers {
+  iceServers: RTCIceServer[]
+  expires_at: string
 }
 
 /** 在线状态（GET /api/presence 与 WS presence 事件） */
@@ -122,6 +164,14 @@ export interface ClientConfig {
   image_max_bytes?: number
   presence_enabled?: boolean
   stt_enabled?: boolean
+  // v0.4.0（SPEC §5）：同样缺失时按关闭处理
+  call_enabled?: boolean
+  call_ring_timeout_seconds?: number
+  file_enabled?: boolean
+  file_max_bytes?: number
+  video_enabled?: boolean
+  video_max_bytes?: number
+  password_reset_enabled?: boolean
 }
 
 export interface AuthResult {
