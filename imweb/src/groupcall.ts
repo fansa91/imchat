@@ -11,6 +11,20 @@ import type { CallKind, GroupCallJoinResult, PublicUser, TrackKind } from './typ
  * GET /api/calls/group/{call_id} 恢复成员与订阅（recover）。
  */
 
+/** 发布前把每条轨道在 offer 中对应 m-line 的 mid 附上：Cloudflare 发布
+ * 本地轨道必填 mid，缺失回 406 invalid_params「Missing mid in track」
+ * （2026-10-22 生产实测，v0.5.2 修）。 */
+function attachMids(pc: RTCPeerConnection, tracks: { kind: TrackKind; mid?: string }[]) {
+  const byKind = new Map<string, string>()
+  for (const t of pc.getTransceivers()) {
+    if (t.sender.track && t.mid) byKind.set(t.sender.track.kind, t.mid)
+  }
+  for (const tr of tracks) {
+    const m = byKind.get(tr.kind)
+    if (m) tr.mid = m
+  }
+}
+
 export interface GParticipant {
   user: PublicUser
   stream: MediaStream | null // 该成员音+视频轨合并的流
@@ -142,7 +156,7 @@ export class GroupCallManager {
 
     // 发布本人轨道：track_name 由服务端分配为 {我的id}/audio|video
     try {
-      const tracks: { track_name: string; kind: TrackKind }[] = []
+      const tracks: { track_name: string; kind: TrackKind; mid?: string }[] = []
       for (const t of stream.getTracks()) {
         pc.addTrack(t, stream)
         const k = t.kind === 'video' ? 'video' : 'audio'
@@ -150,6 +164,7 @@ export class GroupCallManager {
       }
       const offer = await pc.createOffer()
       await pc.setLocalDescription(offer)
+      attachMids(pc, tracks)
       const resp = norm(await api.publishTracks(res.call_id, { session_description: { type: 'offer', sdp: offer.sdp ?? '' }, tracks }))
       await this.applyDesc(resp)
     } catch (e) {
@@ -323,10 +338,12 @@ export class GroupCallManager {
           this.pc.addTrack(track, merged)
           const offer = await this.pc.createOffer()
           await this.pc.setLocalDescription(offer)
+          const vtracks: { track_name: string; kind: TrackKind; mid?: string }[] = [{ track_name: `${me}/video`, kind: 'video' }]
+          attachMids(this.pc, vtracks)
           const resp = norm(
             await api.publishTracks(cur.callId, {
               session_description: { type: 'offer', sdp: offer.sdp ?? '' },
-              tracks: [{ track_name: `${me}/video`, kind: 'video' }],
+              tracks: vtracks,
             }),
           )
           await this.applyDesc(resp)

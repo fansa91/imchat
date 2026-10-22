@@ -127,7 +127,7 @@ export const api = {
   createGroupCall: (conversationId: number, kind: 'audio' | 'video') =>
     req<GroupCallJoinResult>('POST', '/api/calls/group', { conversation_id: conversationId, kind }),
   joinGroupCall: (callId: string) => req<GroupCallJoinResult>('POST', `/api/calls/group/${callId}/join`),
-  publishTracks: (callId: string, body: { session_description: SessionDescription; tracks: { track_name: string; kind: TrackKind }[] }) =>
+  publishTracks: (callId: string, body: { session_description: SessionDescription; tracks: { track_name: string; kind: TrackKind; mid?: string }[] }) =>
     req<TracksResponse>('POST', `/api/calls/group/${callId}/tracks/publish`, body),
   subscribeTracks: (callId: string, body: { tracks: { owner_id: number; kind: TrackKind }[]; session_description?: SessionDescription }) =>
     req<TracksResponse>('POST', `/api/calls/group/${callId}/tracks/subscribe`, body),

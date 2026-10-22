@@ -60,9 +60,17 @@ func (s *sfuStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Location  string `json:"location"`
 				TrackName string `json:"trackName"`
 				SessionID string `json:"sessionId"`
+				MID       string `json:"mid"`
 			} `json:"tracks"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&in)
+		// 真实 API：本地轨道缺 mid 回 406 invalid_params（2026-10-22 生产实测）
+		for _, t := range in.Tracks {
+			if t.Location == "local" && t.MID == "" {
+				write(406, `{"errorCode":"invalid_params","errorDescription":"tracks[0]: Missing mid in track"}`)
+				return
+			}
+		}
 		var out []string
 		for _, t := range in.Tracks {
 			if t.Location == "remote" {
@@ -70,8 +78,11 @@ func (s *sfuStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				s.remoteSession, s.remoteTrack = t.SessionID, t.TrackName
 				s.mu.Unlock()
 			}
-			out = append(out, fmt.Sprintf(`{"trackName":%q,"mid":"mid-%s"}`,
-				t.TrackName, strings.ReplaceAll(t.TrackName, "/", "_")))
+			mid := t.MID
+			if mid == "" {
+				mid = "mid-" + strings.ReplaceAll(t.TrackName, "/", "_")
+			}
+			out = append(out, fmt.Sprintf(`{"trackName":%q,"mid":%q}`, t.TrackName, mid))
 		}
 		write(200, fmt.Sprintf(`{"sessionDescription":{"type":"answer","sdp":"stub-answer-sdp"},"tracks":[%s]}`,
 			strings.Join(out, ",")))
@@ -357,8 +368,8 @@ func v050GroupCalls(suffix string) {
 	_ = json.Unmarshal(rawBad, &er)
 	check(st == 400 && er["code"] == "bad_track", "publish with foreign track_name → 400 bad_track")
 	st, raw := pub(g1.Token, []map[string]any{
-		{"track_name": fmt.Sprintf("%d/audio", g1.User.ID), "kind": "audio"},
-		{"track_name": fmt.Sprintf("%d/video", g1.User.ID), "kind": "video"},
+		{"track_name": fmt.Sprintf("%d/audio", g1.User.ID), "kind": "audio", "mid": "0"},
+		{"track_name": fmt.Sprintf("%d/video", g1.User.ID), "kind": "video", "mid": "1"},
 	})
 	check(st == 200 && strings.Contains(string(raw), "stub-answer-sdp") && strings.Contains(string(raw), `"mid"`),
 		"publish own tracks → SFU answer passthrough")
@@ -374,7 +385,7 @@ func v050GroupCalls(suffix string) {
 	check(st == 403 && er["code"] == "room_full", "third member → 403 room_full")
 
 	// g2 发布音频 + 订阅 g1 的音频（校验 remote 组装到发布方 session）
-	st, _ = pub(g2.Token, []map[string]any{{"track_name": fmt.Sprintf("%d/audio", g2.User.ID), "kind": "audio"}})
+	st, _ = pub(g2.Token, []map[string]any{{"track_name": fmt.Sprintf("%d/audio", g2.User.ID), "kind": "audio", "mid": "0"}})
 	check(st == 200, "g2 publishes audio")
 	st, raw = rawAt(v040Base, "POST", fmt.Sprintf("/api/calls/group/%s/tracks/subscribe", callID), g2.Token,
 		map[string]any{"tracks": []map[string]any{{"owner_id": g1.User.ID, "kind": "audio"}}})

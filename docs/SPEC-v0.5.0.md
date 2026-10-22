@@ -208,7 +208,11 @@ calls:
 - `POST /api/calls/group/{call_id}/join` → 同上返回；房间已满
   403 `room_full`；房间不存在/已结束 404 `room_gone`。
 - `POST /api/calls/group/{call_id}/tracks/publish`
-  `{session_description:{type:"offer",sdp}, tracks:[{track_name, kind}]}` →
+  `{session_description:{type:"offer",sdp}, tracks:[{track_name, kind, mid}]}` →
+  （勘误 v0.5.2：mid 为该轨道在客户端 offer 中对应 m-line 的 mid，
+  Cloudflare 发布本地轨道必填，缺失回 406 invalid_params
+  「Missing mid in track」；客户端在 setLocalDescription 后从
+  getTransceivers() 按 kind 取 mid 附带，服务端原样透传。）
   服务端代理 Cloudflare `POST /apps/{app}/sessions/{sid}/tracks/new`
   （`location:"local"`），把 answer 透传回客户端，并把
   track_name→mid 登记进 Redis 后广播 `group_call_tracks`。

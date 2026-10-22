@@ -555,6 +555,7 @@ func (s *Server) publishGroupTracks(w http.ResponseWriter, r *http.Request, uid 
 		Tracks             []struct {
 			TrackName string `json:"track_name"`
 			Kind      string `json:"kind"`
+			MID       string `json:"mid"`
 		} `json:"tracks"`
 	}
 	if err := decode(r, &req); err != nil || !req.SessionDescription.valid("offer") ||
@@ -571,7 +572,14 @@ func (s *Server) publishGroupTracks(w http.ResponseWriter, r *http.Request, uid 
 			return
 		}
 		seen[t.Kind] = true
-		cfTracks = append(cfTracks, map[string]any{"location": "local", "trackName": t.TrackName})
+		// mid 必透传：Cloudflare 要求本地轨道带上客户端 offer 里对应
+		// m-line 的 mid，缺了回 406 invalid_params "Missing mid in track"
+		// （2026-10-22 生产实测）。
+		cf := map[string]any{"location": "local", "trackName": t.TrackName}
+		if t.MID != "" {
+			cf["mid"] = t.MID
+		}
+		cfTracks = append(cfTracks, cf)
 	}
 	ctx := r.Context()
 	raw, parsed, err := s.sfuTracksNew(ctx, sid, cfTracks, req.SessionDescription)
