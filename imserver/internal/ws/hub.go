@@ -19,6 +19,7 @@ type event struct {
 	Targets       []uint64        `json:"t"`
 	ExcludeConnID string          `json:"x,omitempty"`
 	Frame         json.RawMessage `json:"f"`
+	Disconnect    bool            `json:"d,omitempty"` // v0.4.0：投递后断开目标用户的全部连接（session_revoked 用）
 }
 
 type Hub struct {
@@ -27,6 +28,8 @@ type Hub struct {
 
 	mu    sync.RWMutex
 	conns map[uint64]map[*Client]struct{}
+
+	callStore callRecordStore // v0.4.0：通话巡检写通话记录用，由 api 层注入（可为 nil）
 }
 
 func NewHub(rdb *redis.Client, nodeID string) *Hub {
@@ -160,8 +163,35 @@ func (h *Hub) deliverLocal(targets []uint64, exclude string, frame []byte) {
 	}
 }
 
+// DisconnectUser 先投递 frame，再断开目标用户的全部连接（跨节点走 im:events 通道）。
+// 用于 token_version 变更后的 session_revoked：先推帧说明原因，再断开要求重新登录。
+func (h *Hub) DisconnectUser(ctx context.Context, uid uint64, frame []byte) {
+	b, _ := json.Marshal(event{Targets: []uint64{uid}, Frame: frame, Disconnect: true})
+	if err := h.rdb.Publish(ctx, eventsChannel, b).Err(); err != nil {
+		slog.Error("redis publish failed, disconnecting locally only", "err", err)
+		h.deliverLocal([]uint64{uid}, "", frame)
+		h.disconnectLocal([]uint64{uid})
+	}
+}
+
+// disconnectLocal 断开本节点上目标用户的全部连接。
+func (h *Hub) disconnectLocal(targets []uint64) {
+	h.mu.RLock()
+	var cs []*Client
+	for _, uid := range targets {
+		for c := range h.conns[uid] {
+			cs = append(cs, c)
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range cs {
+		c.closeOnce()
+	}
+}
+
 // Run 订阅 Redis 事件通道，直到 ctx 结束。
 func (h *Hub) Run(ctx context.Context) error {
+	go h.callSweeper(ctx) // v0.4.0：响铃超时巡检（每个节点都跑，终结的原子删除保证只有一个写者）
 	sub := h.rdb.Subscribe(ctx, eventsChannel)
 	defer sub.Close()
 	if _, err := sub.Receive(ctx); err != nil {
@@ -182,6 +212,9 @@ func (h *Hub) Run(ctx context.Context) error {
 				continue
 			}
 			h.deliverLocal(ev.Targets, ev.ExcludeConnID, ev.Frame)
+			if ev.Disconnect {
+				h.disconnectLocal(ev.Targets)
+			}
 		}
 	}
 }

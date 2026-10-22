@@ -1,4 +1,4 @@
-# imserver v0.3.0
+# imserver v0.4.0
 
 类 iMessage 聊天服务端：Go + MySQL + Redis + WebSocket，语音文件存放在 S3 兼容存储（推荐 Garage）。
 

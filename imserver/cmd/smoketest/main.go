@@ -2,6 +2,11 @@
 // v0.1：注册、单聊收发、多设备同步、幂等、已读、离线补拉。
 // v0.2：群聊、撤回、仅自己删除、引用回复、表情回应、语音上传（预签名）、生命周期规则。
 // v0.3：图片消息、在线状态（含跨实例）、语音转文字（假提供方）。
+// v0.4：文件/视频消息、头像昵称、重置/修改密码（假 SMTP）、1 对 1 通话信令（假 Cloudflare）。
+//
+//	-v040-base 指向开启 calls+smtp 的实例（calls.base_url → -calls-stub、smtp → -smtp-stub、tls_mode: none，
+//	ring_timeout_seconds 请配小如 3 以便测响铃超时），留空跳过通话/密码检查。
+//
 // 用法: go run ./cmd/smoketest -base http://127.0.0.1:8092 -s3-endpoint 127.0.0.1:3900 -s3-key GK... -s3-secret ... -bucket imchat
 package main
 
@@ -109,6 +114,9 @@ func main() {
 	flag.BoolVar(&s3SSL, "s3-ssl", false, "S3 使用 https")
 	flag.StringVar(&sttBase, "stt-base", "", "v0.3.0：开启 stt 的第二个实例地址（其 stt.*.base_url 指向 -stt-stub），留空跳过转写成功路径")
 	flag.StringVar(&sttStubAddr, "stt-stub", "127.0.0.1:18099", "v0.3.0：假 STT 提供方监听地址")
+	flag.StringVar(&v040Base, "v040-base", "", "v0.4.0：开启 calls+smtp 的实例地址，留空跳过通话/密码检查")
+	flag.StringVar(&callsStubAddr, "calls-stub", "127.0.0.1:18126", "v0.4.0：假 Cloudflare 监听地址")
+	flag.StringVar(&smtpStubAddr, "smtp-stub", "127.0.0.1:18125", "v0.4.0：假 SMTP 监听地址")
 	flag.Parse()
 	suffix := fmt.Sprintf("%d%d", time.Now().Unix(), rand.Intn(1000))
 
@@ -194,5 +202,6 @@ func main() {
 
 	v020(suffix, alice, bob, eve)
 	v030(suffix, alice, bob, eve)
+	v040(suffix, alice, bob, eve)
 	fmt.Printf("\nALL PASSED (%d checks)\n", passed)
 }

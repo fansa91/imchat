@@ -38,6 +38,14 @@ func (s *Server) clientConfig(w http.ResponseWriter, r *http.Request, uid uint64
 		"image_max_bytes":  s.cfg.Storage.ImageMaxBytes,
 		"presence_enabled": true,
 		"stt_enabled":      s.stt != nil,
+		// v0.4.0
+		"call_enabled":              s.cfg.Calls.Enabled && s.cfg.Calls.Configured(),
+		"call_ring_timeout_seconds": s.cfg.Calls.RingTimeoutSeconds,
+		"file_enabled":              s.storage != nil,
+		"file_max_bytes":            s.cfg.Storage.FileMaxBytes,
+		"video_enabled":             s.storage != nil,
+		"video_max_bytes":           s.cfg.Storage.VideoMaxBytes,
+		"password_reset_enabled":    s.mailer != nil,
 	}
 	if s.storage != nil {
 		c := s.storage.Config()
@@ -46,6 +54,8 @@ func (s *Server) clientConfig(w http.ResponseWriter, r *http.Request, uid uint64
 		out["voice_ttl_days"] = c.VoiceTTLDays
 		out["image_max_bytes"] = c.ImageMaxBytes
 		out["image_ttl_days"] = c.ImageTTLDays
+		out["file_max_bytes"] = c.FileMaxBytes
+		out["video_max_bytes"] = c.VideoMaxBytes
 	}
 	writeJSON(w, 200, out)
 }
@@ -470,12 +480,13 @@ func (s *Server) presignUpload(w http.ResponseWriter, r *http.Request, uid uint6
 		return
 	}
 	var req struct {
-		Kind       string `json:"kind"` // voice | image
+		Kind       string `json:"kind"` // voice | image | video | file | avatar
 		Mime       string `json:"mime"`
 		Size       int64  `json:"size"`
-		DurationMs int    `json:"duration_ms"` // voice
-		Width      int    `json:"width"`       // image（可选，仅校验非负）
-		Height     int    `json:"height"`      // image
+		DurationMs int    `json:"duration_ms"` // voice / video
+		Width      int    `json:"width"`       // image / video（可选，仅校验非负）
+		Height     int    `json:"height"`      // image / video
+		Name       string `json:"name"`        // file（v0.4.0）：原始文件名
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "bad_request", "参数错误")
@@ -533,8 +544,83 @@ func (s *Server) presignUpload(w http.ResponseWriter, r *http.Request, uid uint6
 			"key": key, "url": u, "method": "PUT", "headers": map[string]string{"Content-Type": mime},
 			"expires_at": exp.UTC().Format(time.RFC3339), "max_bytes": cfg.ImageMaxBytes,
 		})
+	case "video":
+		mime, ext, ok := storage.NormalizeVideoMime(req.Mime)
+		if !ok {
+			writeErr(w, 400, "bad_mime", "只支持 MP4 / WebM / QuickTime 视频")
+			return
+		}
+		if req.Size <= 0 || req.Size > cfg.VideoMaxBytes {
+			writeErr(w, 400, "too_large", fmt.Sprintf("视频不能超过 %d MB", cfg.VideoMaxBytes>>20))
+			return
+		}
+		if req.DurationMs <= 0 || req.DurationMs > cfg.VideoMaxSeconds*1000+999 {
+			writeErr(w, 400, "bad_duration", fmt.Sprintf("视频时长不能超过 %d 秒", cfg.VideoMaxSeconds))
+			return
+		}
+		if req.Width < 0 || req.Height < 0 {
+			writeErr(w, 400, "bad_request", "视频宽高无效")
+			return
+		}
+		key := storage.NewKey("video", uid, ext)
+		u, exp, err := s.storage.PresignPut(r.Context(), key)
+		if err != nil {
+			slog.Error("presign put", "err", err)
+			writeErr(w, 500, "internal", "生成上传链接失败")
+			return
+		}
+		writeJSON(w, 200, map[string]any{
+			"key": key, "url": u, "method": "PUT", "headers": map[string]string{"Content-Type": mime},
+			"expires_at": exp.UTC().Format(time.RFC3339), "max_bytes": cfg.VideoMaxBytes,
+		})
+	case "file":
+		name := storage.SanitizeFileName(req.Name)
+		if name == "" {
+			writeErr(w, 400, "bad_name", "文件名无效")
+			return
+		}
+		if req.Size <= 0 || req.Size > cfg.FileMaxBytes {
+			writeErr(w, 400, "too_large", fmt.Sprintf("文件不能超过 %d MB", cfg.FileMaxBytes>>20))
+			return
+		}
+		mime := strings.TrimSpace(req.Mime)
+		if mime == "" {
+			mime = "application/octet-stream"
+		}
+		key := storage.NewKey("file", uid, storage.FileExt(name))
+		u, exp, err := s.storage.PresignPut(r.Context(), key)
+		if err != nil {
+			slog.Error("presign put", "err", err)
+			writeErr(w, 500, "internal", "生成上传链接失败")
+			return
+		}
+		writeJSON(w, 200, map[string]any{
+			"key": key, "url": u, "method": "PUT", "headers": map[string]string{"Content-Type": mime},
+			"expires_at": exp.UTC().Format(time.RFC3339), "max_bytes": cfg.FileMaxBytes,
+		})
+	case "avatar":
+		mime, ext, ok := storage.NormalizeImageMime(req.Mime)
+		if !ok {
+			writeErr(w, 400, "bad_mime", "只支持 JPEG / PNG / WebP / GIF 图片")
+			return
+		}
+		if req.Size <= 0 || req.Size > cfg.AvatarMaxBytes {
+			writeErr(w, 400, "too_large", fmt.Sprintf("头像不能超过 %d MB", cfg.AvatarMaxBytes>>20))
+			return
+		}
+		key := storage.NewKey("avatar", uid, ext)
+		u, exp, err := s.storage.PresignPut(r.Context(), key)
+		if err != nil {
+			slog.Error("presign put", "err", err)
+			writeErr(w, 500, "internal", "生成上传链接失败")
+			return
+		}
+		writeJSON(w, 200, map[string]any{
+			"key": key, "url": u, "method": "PUT", "headers": map[string]string{"Content-Type": mime},
+			"expires_at": exp.UTC().Format(time.RFC3339), "max_bytes": cfg.AvatarMaxBytes,
+		})
 	default:
-		writeErr(w, 400, "bad_kind", "kind 只支持 voice 或 image")
+		writeErr(w, 400, "bad_kind", "kind 只支持 voice / image / video / file / avatar")
 	}
 }
 
@@ -563,7 +649,8 @@ func (s *Server) mediaURL(w http.ResponseWriter, r *http.Request, uid uint64) {
 		writeErr(w, 410, "recalled", "消息已撤回")
 		return
 	}
-	if m.MsgType != store.MsgVoice && m.MsgType != store.MsgImage {
+	if m.MsgType != store.MsgVoice && m.MsgType != store.MsgImage &&
+		m.MsgType != store.MsgVideo && m.MsgType != store.MsgFile {
 		writeErr(w, 400, "not_media", "不是媒体消息")
 		return
 	}
@@ -579,14 +666,30 @@ func (s *Server) mediaURL(w http.ResponseWriter, r *http.Request, uid uint64) {
 	// 不访问对象存储（跨地域部署时省一次往返）：按消息时间判断是否已被生命周期删除。
 	// 生命周期按天执行，边界附近对象可能已删也可能还在，客户端下载 404 时同样显示“已过期”。
 	cfg := s.storage.Config()
-	if m.MsgType == store.MsgVoice {
+	expired := func(ttlDays int) bool {
+		return ttlDays > 0 && time.Since(m.CreatedAt) > time.Duration(ttlDays)*24*time.Hour
+	}
+	switch m.MsgType {
+	case store.MsgVoice:
 		if time.Since(m.CreatedAt) > time.Duration(cfg.VoiceTTLDays)*24*time.Hour {
 			writeErr(w, 410, "expired", "语音已过期")
 			return
 		}
-	} else if cfg.ImageTTLDays > 0 && time.Since(m.CreatedAt) > time.Duration(cfg.ImageTTLDays)*24*time.Hour {
-		writeErr(w, 410, "expired", "图片已过期")
-		return
+	case store.MsgImage:
+		if expired(cfg.ImageTTLDays) {
+			writeErr(w, 410, "expired", "图片已过期")
+			return
+		}
+	case store.MsgVideo:
+		if expired(cfg.VideoTTLDays) {
+			writeErr(w, 410, "expired", "视频已过期")
+			return
+		}
+	case store.MsgFile:
+		if expired(cfg.FileTTLDays) {
+			writeErr(w, 410, "expired", "文件已过期")
+			return
+		}
 	}
 	u, exp, err := s.storage.PresignGet(ctx, key, mime)
 	if err != nil {

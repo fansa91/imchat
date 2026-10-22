@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -38,6 +41,7 @@ const (
 	MsgVoice  = 3
 	MsgVideo  = 4
 	MsgFile   = 5
+	MsgCall   = 6  // 通话记录（v0.4.0），只能由服务端生成，content 为 JSON
 	MsgSystem = 10 // 系统消息（入群/退群/改名/公告），content 为 JSON
 )
 
@@ -85,6 +89,9 @@ var upgradeColumns = []struct{ table, column, ddl string }{
 	{"messages", "mod_seq", "ADD COLUMN mod_seq BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '撤回/回应变化时更新，用于离线同步变更' AFTER recalled_at"},
 	// v0.3.0
 	{"users", "last_seen_at", "ADD COLUMN last_seen_at DATETIME(3) NULL COMMENT '最后一个连接断开的时间' AFTER created_at"},
+	// v0.4.0
+	{"users", "token_version", "ADD COLUMN token_version INT NOT NULL DEFAULT 0 COMMENT '登录态版本，改密/重置时递增使旧 token 失效' AFTER last_seen_at"},
+	{"users", "avatar_key", "ADD COLUMN avatar_key VARCHAR(512) NOT NULL DEFAULT '' COMMENT '头像对象 key（avatar/ 前缀）' AFTER token_version"},
 }
 
 var upgradeIndexes = []struct{ table, index, ddl string }{
@@ -159,6 +166,22 @@ type User struct {
 	AvatarURL    string    `json:"avatar_url"`
 	CreatedAt    time.Time `json:"created_at"`
 	PasswordHash string    `json:"-"`
+	AvatarKey    string    `json:"-"` // v0.4.0：头像对象 key；非空时 AvatarURL 拼装为 /api/users/{id}/avatar?v=…
+	TokenVersion int       `json:"-"` // v0.4.0：登录态版本（JWT tv claim 比对用）
+}
+
+// avatarShortHash 头像 key 的短哈希（作 avatar_url 的版本参数，key 变则 URL 变，客户端据此刷新缓存）。
+func avatarShortHash(key string) string {
+	h := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(h[:])[:8]
+}
+
+// ApplyAvatar 按 avatar_key 拼装对外 avatar_url：非空时返回鉴权下发地址，
+// 为空时保留库里原 avatar_url（旧数据手工填的值不迁移、原样返回）。
+func (u *User) ApplyAvatar() {
+	if u.AvatarKey != "" {
+		u.AvatarURL = fmt.Sprintf("/api/users/%d/avatar?v=%s", u.ID, avatarShortHash(u.AvatarKey))
+	}
 }
 
 func isDup(err error) bool {
@@ -179,16 +202,17 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, nickname string) (*
 	return s.GetUser(ctx, uint64(id))
 }
 
-const userCols = `id, email, nickname, avatar_url, created_at, password_hash`
+const userCols = `id, email, nickname, avatar_url, created_at, password_hash, avatar_key, token_version`
 
 func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	u := &User{}
-	if err := row.Scan(&u.ID, &u.Email, &u.Nickname, &u.AvatarURL, &u.CreatedAt, &u.PasswordHash); err != nil {
+	if err := row.Scan(&u.ID, &u.Email, &u.Nickname, &u.AvatarURL, &u.CreatedAt, &u.PasswordHash, &u.AvatarKey, &u.TokenVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	u.ApplyAvatar()
 	return u, nil
 }
 
@@ -373,7 +397,7 @@ func (s *Store) listConversations(ctx context.Context, uid, onlyCID uint64) ([]C
 	q := `
 		SELECT c.id, c.type, c.last_seq, c.mod_seq, m.read_seq, m.join_seq, m.role, c.updated_at,
 		       c.name, c.owner_id, c.announcement, c.announcement_by, c.announcement_at,
-		       u.id, u.email, u.nickname, u.avatar_url, u.created_at
+		       u.id, u.email, u.nickname, u.avatar_url, u.created_at, u.avatar_key
 		FROM conversation_members m
 		JOIN conversations c ON c.id = m.conversation_id
 		LEFT JOIN conversation_members pm ON pm.conversation_id = c.id AND pm.user_id <> m.user_id AND c.type = 1
@@ -394,16 +418,17 @@ func (s *Store) listConversations(ctx context.Context, uid, onlyCID uint64) ([]C
 	for rows.Next() {
 		var cs ConversationSummary
 		var pid sql.NullInt64
-		var pemail, pnick, pavatar sql.NullString
+		var pemail, pnick, pavatar, pavatarkey sql.NullString
 		var pcreated, annAt sql.NullTime
 		if err := rows.Scan(&cs.ID, &cs.Type, &cs.LastSeq, &cs.ModSeq, &cs.ReadSeq, &cs.JoinSeq, &cs.MyRole, &cs.UpdatedAt,
 			&cs.Name, &cs.OwnerID, &cs.Announcement, &cs.AnnouncementBy, &annAt,
-			&pid, &pemail, &pnick, &pavatar, &pcreated); err != nil {
+			&pid, &pemail, &pnick, &pavatar, &pcreated, &pavatarkey); err != nil {
 			return nil, err
 		}
 		if pid.Valid {
 			cs.Peer = &User{ID: uint64(pid.Int64), Email: pemail.String, Nickname: pnick.String,
-				AvatarURL: pavatar.String, CreatedAt: pcreated.Time}
+				AvatarURL: pavatar.String, CreatedAt: pcreated.Time, AvatarKey: pavatarkey.String}
+			cs.Peer.ApplyAvatar()
 		}
 		if annAt.Valid {
 			t := annAt.Time
@@ -443,7 +468,7 @@ func (s *Store) listConversations(ctx context.Context, uid, onlyCID uint64) ([]C
 
 func (s *Store) membersPreview(ctx context.Context, cid uint64, n int) ([]*User, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT u.id, u.email, u.nickname, u.avatar_url, u.created_at, u.password_hash
+		SELECT u.id, u.email, u.nickname, u.avatar_url, u.created_at, u.password_hash, u.avatar_key, u.token_version
 		FROM conversation_members m JOIN users u ON u.id = m.user_id
 		WHERE m.conversation_id = ? ORDER BY m.role DESC, m.joined_at, m.user_id LIMIT ?`, cid, n)
 	if err != nil {
@@ -778,6 +803,14 @@ func PreviewText(msgType int, content string, maxRunes int) string {
 		return "[视频]"
 	case MsgFile:
 		return "[文件]"
+	case MsgCall:
+		var cc struct {
+			Kind string `json:"kind"`
+		}
+		if json.Unmarshal([]byte(content), &cc) == nil && cc.Kind == "video" {
+			return "[视频通话]"
+		}
+		return "[语音通话]"
 	case MsgSystem:
 		return SystemText(content)
 	}
@@ -826,6 +859,7 @@ var (
 	ErrNotSender       = errors.New("not sender")
 	ErrRecallExpired   = errors.New("recall window expired")
 	ErrAlreadyRecalled = errors.New("already recalled")
+	ErrCallRecord      = errors.New("call record cannot be recalled") // v0.4.0：通话记录不可撤回
 )
 
 // bumpMod 在事务内把会话 mod_seq +1 并返回新值。
@@ -857,6 +891,9 @@ func (s *Store) Recall(ctx context.Context, cid, seq, uid uint64, window time.Du
 		`SELECT `+msgCols+` FROM messages m WHERE m.conversation_id = ? AND m.seq = ? FOR UPDATE`, cid, seq))
 	if err != nil {
 		return nil, nil, err
+	}
+	if before.MsgType == MsgCall {
+		return nil, nil, ErrCallRecord
 	}
 	if before.SenderID != uid || before.MsgType == MsgSystem {
 		return nil, nil, ErrNotSender

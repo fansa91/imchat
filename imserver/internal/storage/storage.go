@@ -6,7 +6,7 @@
 //  2. 客户端直接 PUT 文件到对象存储
 //  3. 客户端发送消息时带上 key，服务端 StatObject + 读取文件头校验真实大小和类型，通过后才落库
 //
-// key 格式：{kind}/{uid}/{yyyymm}/{32位随机hex}.{ext}，kind 为 voice 或 image（v0.3.0）。
+// key 格式：{kind}/{uid}/{yyyymm}/{32位随机hex}.{ext}，kind 为 voice/image（v0.3.0）、video/file/avatar（v0.4.0）。
 // key 中带上传者 uid，发送消息时校验只能引用自己上传的文件。
 package storage
 
@@ -42,7 +42,11 @@ var (
 const (
 	LifecycleRuleID      = "imserver-voice-expire"
 	ImageLifecycleRuleID = "imserver-image-expire" // 仅 image_ttl_days > 0 时设置
+	FileLifecycleRuleID  = "imserver-file-expire"  // v0.4.0：仅 file_ttl_days > 0 时设置
+	VideoLifecycleRuleID = "imserver-video-expire" // v0.4.0：仅 video_ttl_days > 0 时设置
 )
+
+var lifecycleRuleIDs = []string{LifecycleRuleID, ImageLifecycleRuleID, FileLifecycleRuleID, VideoLifecycleRuleID}
 
 type Storage struct {
 	cfg     config.StorageConfig
@@ -135,14 +139,32 @@ func (s *Storage) EnsureLifecycle(ctx context.Context) error {
 			Expiration: lifecycle.Expiration{Days: lifecycle.ExpirationDays(s.cfg.ImageTTLDays)},
 		})
 	}
+	if s.cfg.FileTTLDays > 0 {
+		want = append(want, lifecycle.Rule{
+			ID:         FileLifecycleRuleID,
+			Status:     "Enabled",
+			RuleFilter: lifecycle.Filter{Prefix: "file/"},
+			Expiration: lifecycle.Expiration{Days: lifecycle.ExpirationDays(s.cfg.FileTTLDays)},
+		})
+	}
+	if s.cfg.VideoTTLDays > 0 {
+		want = append(want, lifecycle.Rule{
+			ID:         VideoLifecycleRuleID,
+			Status:     "Enabled",
+			RuleFilter: lifecycle.Filter{Prefix: "video/"},
+			Expiration: lifecycle.Expiration{Days: lifecycle.ExpirationDays(s.cfg.VideoTTLDays)},
+		})
+	}
 	same := func(a, b lifecycle.Rule) bool {
 		return a.Status == b.Status && a.Expiration.Days == b.Expiration.Days && a.RuleFilter.Prefix == b.RuleFilter.Prefix
 	}
 	// 已是期望状态则不写
 	existing := map[string]lifecycle.Rule{}
 	for _, r := range conf.Rules {
-		if r.ID == LifecycleRuleID || r.ID == ImageLifecycleRuleID {
-			existing[r.ID] = r
+		for _, id := range lifecycleRuleIDs {
+			if r.ID == id {
+				existing[r.ID] = r
+			}
 		}
 	}
 	upToDate := len(existing) == len(want)
@@ -156,7 +178,13 @@ func (s *Storage) EnsureLifecycle(ctx context.Context) error {
 	}
 	rules := want
 	for _, r := range conf.Rules {
-		if r.ID == LifecycleRuleID || r.ID == ImageLifecycleRuleID {
+		own := false
+		for _, id := range lifecycleRuleIDs {
+			if r.ID == id {
+				own = true
+			}
+		}
+		if own {
 			continue
 		}
 		rules = append(rules, r)
@@ -200,7 +228,7 @@ func (s *Storage) LifecycleDays(ctx context.Context) (int, error) {
 
 // ---------- key ----------
 
-var keyRe = regexp.MustCompile(`^(voice|image)/(\d{1,20})/(\d{6})/([a-f0-9]{32})\.([a-z0-9]{2,5})$`)
+var keyRe = regexp.MustCompile(`^(voice|image|video|file|avatar)/(\d{1,20})/(\d{6})/([a-f0-9]{32})\.([a-z0-9]{1,10})$`)
 
 // ParseKey 校验 key 格式，返回 kind 与上传者 uid。
 func ParseKey(key string) (kind string, uid uint64, ok bool) {
@@ -412,6 +440,142 @@ func (s *Storage) VerifyImage(ctx context.Context, key, declaredMime string) (*O
 		return reject("图片格式与声明不符")
 	}
 	return &ObjectInfo{Size: st.Size, Mime: real}, nil
+}
+
+// ---------- 视频 / 文件类型（v0.4.0） ----------
+
+// videoMimes 允许的视频 MIME → 扩展名。
+var videoMimes = map[string]string{
+	"video/mp4":       "mp4",
+	"video/webm":      "webm",
+	"video/quicktime": "mov",
+}
+
+// NormalizeVideoMime 校验视频 MIME，返回基础 MIME 和扩展名。
+func NormalizeVideoMime(m string) (mime, ext string, ok bool) {
+	m = strings.ToLower(strings.TrimSpace(strings.SplitN(m, ";", 2)[0]))
+	ext, ok = videoMimes[m]
+	return m, ext, ok
+}
+
+// sniffVideo 根据文件头判断真实视频格式：EBML → webm，ftyp 容器按 brand 区分 mp4/quicktime。
+func sniffVideo(h []byte) string {
+	has := func(off int, sig string) bool { return len(h) >= off+len(sig) && string(h[off:off+len(sig)]) == sig }
+	switch {
+	case has(0, "\x1a\x45\xdf\xa3"):
+		return "video/webm"
+	case has(4, "ftyp"):
+		if has(8, "qt  ") {
+			return "video/quicktime"
+		}
+		return "video/mp4"
+	}
+	return ""
+}
+
+// SanitizeFileName 清理文件名：去掉路径分隔符与控制字符，截断到 128 个字符。
+// 清理后为空返回 ""（调用方按 bad_name 处理）。
+func SanitizeFileName(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	var b strings.Builder
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	name = strings.TrimSpace(b.String())
+	if r := []rune(name); len(r) > 128 {
+		name = string(r[:128])
+	}
+	return name
+}
+
+// FileExt 从文件名取扩展名（小写、仅 [a-z0-9]、最长 10），无合法扩展名返回 "bin"。
+func FileExt(name string) string {
+	i := strings.LastIndex(name, ".")
+	if i < 0 || i == len(name)-1 {
+		return "bin"
+	}
+	ext := strings.ToLower(name[i+1:])
+	for _, r := range ext {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			return "bin"
+		}
+	}
+	if len(ext) > 10 {
+		return "bin"
+	}
+	return ext
+}
+
+// VerifyVideo 校验已上传的视频对象：存在、大小不超限、文件头是允许的视频格式且与声明一致。
+// 不合格的对象会被删除。
+func (s *Storage) VerifyVideo(ctx context.Context, key, declaredMime string) (*ObjectInfo, error) {
+	st, err := s.cli.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		if r := minio.ToErrorResponse(err); r.Code == "NoSuchKey" || r.StatusCode == http.StatusNotFound {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	reject := func(msg string) (*ObjectInfo, error) {
+		_ = s.cli.RemoveObject(context.Background(), s.cfg.Bucket, key, minio.RemoveObjectOptions{})
+		return nil, errors.New(msg)
+	}
+	if st.Size <= 0 || st.Size > s.cfg.VideoMaxBytes {
+		return reject(fmt.Sprintf("视频大小超出限制（最大 %d MB）", s.cfg.VideoMaxBytes>>20))
+	}
+	opts := minio.GetObjectOptions{}
+	_ = opts.SetRange(0, 15)
+	obj, err := s.cli.GetObject(ctx, s.cfg.Bucket, key, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer obj.Close()
+	head, err := io.ReadAll(io.LimitReader(obj, 16))
+	if err != nil {
+		return nil, err
+	}
+	real := sniffVideo(head)
+	if real == "" {
+		return reject("不是有效的视频文件")
+	}
+	if decl, _, _ := NormalizeVideoMime(declaredMime); decl != real {
+		return reject("视频格式与声明不符")
+	}
+	return &ObjectInfo{Size: st.Size, Mime: real}, nil
+}
+
+// VerifyFile 校验已上传的文件对象：只查存在与大小上限（文件无格式白名单）。
+func (s *Storage) VerifyFile(ctx context.Context, key string) (*ObjectInfo, error) {
+	st, err := s.cli.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		if r := minio.ToErrorResponse(err); r.Code == "NoSuchKey" || r.StatusCode == http.StatusNotFound {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if st.Size <= 0 || st.Size > s.cfg.FileMaxBytes {
+		_ = s.cli.RemoveObject(context.Background(), s.cfg.Bucket, key, minio.RemoveObjectOptions{})
+		return nil, errors.New(fmt.Sprintf("文件大小超出限制（最大 %d MB）", s.cfg.FileMaxBytes>>20))
+	}
+	return &ObjectInfo{Size: st.Size, Mime: st.ContentType}, nil
+}
+
+// Size 返回对象大小；不存在返回 ErrNotFound。
+func (s *Storage) Size(ctx context.Context, key string) (int64, error) {
+	st, err := s.cli.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		if r := minio.ToErrorResponse(err); r.Code == "NoSuchKey" || r.StatusCode == http.StatusNotFound {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return st.Size, nil
 }
 
 // Read 读取整个对象（语音转文字用），超过 maxBytes 报错。对象不存在返回 ErrNotFound。

@@ -48,6 +48,7 @@ func (c *Client) handleSend(ctx context.Context, env Envelope) {
 	if req.MsgType == 0 {
 		req.MsgType = store.MsgText
 	}
+	// 客户端可发 1–5；6=通话记录只能由服务端生成，客户端发送一律 bad_request（SPEC §1.4）
 	if req.MsgType < 1 || req.MsgType > 5 {
 		c.fail(env.ID, "bad_request", "msg_type 无效")
 		return
@@ -67,7 +68,7 @@ func (c *Client) handleSend(ctx context.Context, env Envelope) {
 	}
 	if req.ReplyToSeq > 0 {
 		orig, err := c.store.GetMessage(ctx, req.ConversationID, req.ReplyToSeq)
-		if err != nil || req.ReplyToSeq <= mem.JoinSeq || orig.MsgType == store.MsgSystem {
+		if err != nil || req.ReplyToSeq <= mem.JoinSeq || orig.MsgType == store.MsgSystem || orig.MsgType == store.MsgCall {
 			c.fail(env.ID, "bad_request", "引用的消息不存在")
 			return
 		}
@@ -82,6 +83,22 @@ func (c *Client) handleSend(ctx context.Context, env Envelope) {
 	}
 	if req.MsgType == store.MsgImage {
 		content, code, msg := c.validateImage(ctx, req.Content)
+		if code != "" {
+			c.fail(env.ID, code, msg)
+			return
+		}
+		req.Content = content
+	}
+	if req.MsgType == store.MsgVideo {
+		content, code, msg := c.validateVideo(ctx, req.Content)
+		if code != "" {
+			c.fail(env.ID, code, msg)
+			return
+		}
+		req.Content = content
+	}
+	if req.MsgType == store.MsgFile {
+		content, code, msg := c.validateFile(ctx, req.Content)
 		if code != "" {
 			c.fail(env.ID, code, msg)
 			return
@@ -251,6 +268,9 @@ func (c *Client) handleRecall(ctx context.Context, env Envelope) {
 	case errors.Is(err, store.ErrNotFound):
 		c.fail(env.ID, "not_found", "消息不存在")
 		return
+	case errors.Is(err, store.ErrCallRecord):
+		c.fail(env.ID, "forbidden", "通话记录不可撤回")
+		return
 	case errors.Is(err, store.ErrNotSender):
 		c.fail(env.ID, "forbidden", "只能撤回自己发送的消息")
 		return
@@ -265,14 +285,27 @@ func (c *Client) handleRecall(ctx context.Context, env Envelope) {
 		c.fail(env.ID, "internal", "服务器错误")
 		return
 	}
-	// 撤回的语音/图片同时删除服务器上的文件；语音的转文字结果一并删除
-	if (before.MsgType == store.MsgVoice || before.MsgType == store.MsgImage) && c.deps.Storage != nil {
+	// 撤回的语音/图片/视频/文件同时删除服务器上的文件（视频连封面一起）；语音的转文字结果一并删除
+	if (before.MsgType == store.MsgVoice || before.MsgType == store.MsgImage ||
+		before.MsgType == store.MsgVideo || before.MsgType == store.MsgFile) && c.deps.Storage != nil {
+		keys := []string{}
 		if key, _, _ := MediaKey(before.Content); key != "" {
+			keys = append(keys, key)
+		}
+		if before.MsgType == store.MsgVideo {
+			var vc VideoContent
+			if json.Unmarshal([]byte(before.Content), &vc) == nil && vc.PosterKey != "" {
+				keys = append(keys, vc.PosterKey)
+			}
+		}
+		if len(keys) > 0 {
 			go func() {
 				rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				if err := c.deps.Storage.Remove(rctx, key); err != nil {
-					slog.Warn("remove recalled media", "key", key, "err", err)
+				for _, key := range keys {
+					if err := c.deps.Storage.Remove(rctx, key); err != nil {
+						slog.Warn("remove recalled media", "key", key, "err", err)
+					}
 				}
 			}()
 		}
@@ -374,4 +407,107 @@ func (c *Client) handleDelete(ctx context.Context, env Envelope) {
 	c.hub.Publish(ctx, []uint64{c.userID}, "", encode("deleted", "", map[string]any{
 		"conversation_id": req.ConversationID, "seqs": seqs,
 	}))
+}
+
+// validateVideo 校验视频消息（v0.4.0）：key 属于自己的 video/ 前缀、时长/宽高合法、
+// 封面（如有）是自己的 image/ 前缀、对象已上传且大小/格式合格。返回规范化后的 content。
+func (c *Client) validateVideo(ctx context.Context, raw string) (content, code, msg string) {
+	st := c.deps.Storage
+	if st == nil {
+		return "", "unsupported", "服务器未启用视频消息"
+	}
+	var v VideoContent
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return "", "bad_request", "视频消息格式错误"
+	}
+	kind, owner, ok := storage.ParseKey(v.Key)
+	if !ok || kind != "video" || owner != c.userID {
+		return "", "bad_request", "无效的视频文件"
+	}
+	mime, _, ok := storage.NormalizeVideoMime(v.Mime)
+	if !ok {
+		return "", "bad_request", "不支持的视频格式"
+	}
+	maxMs := st.Config().VideoMaxSeconds*1000 + 999
+	if v.DurationMs <= 0 || v.DurationMs > maxMs {
+		return "", "bad_request", "视频时长无效"
+	}
+	if v.Width <= 0 || v.Height <= 0 || v.Width > maxImageSide || v.Height > maxImageSide {
+		return "", "bad_request", "视频宽高无效"
+	}
+	if v.PosterKey != "" {
+		pk, powner, pok := storage.ParseKey(v.PosterKey)
+		if !pok || pk != "image" || powner != c.userID {
+			return "", "bad_request", "无效的视频封面"
+		}
+	}
+	if !st.Config().VerifyUpload {
+		if v.Size <= 0 || v.Size > st.Config().VideoMaxBytes {
+			return "", "bad_request", "视频大小无效"
+		}
+		out, _ := json.Marshal(VideoContent{Key: v.Key, Mime: mime, Size: v.Size, DurationMs: v.DurationMs, Width: v.Width, Height: v.Height, PosterKey: v.PosterKey})
+		return string(out), "", ""
+	}
+	vctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	info, err := st.VerifyVideo(vctx, v.Key, mime)
+	if errors.Is(err, storage.ErrNotFound) {
+		return "", "bad_request", "视频文件未上传或已过期"
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "视频") || strings.Contains(err.Error(), "大小") {
+			return "", "bad_request", err.Error()
+		}
+		slog.Error("verify video", "err", err)
+		return "", "internal", "对象存储错误"
+	}
+	out, _ := json.Marshal(VideoContent{Key: v.Key, Mime: info.Mime, Size: info.Size, DurationMs: v.DurationMs, Width: v.Width, Height: v.Height, PosterKey: v.PosterKey})
+	return string(out), "", ""
+}
+
+// validateFile 校验文件消息（v0.4.0）：key 属于自己的 file/ 前缀、文件名合法、
+// 对象已上传且大小合格（文件无格式白名单）。返回规范化后的 content。
+func (c *Client) validateFile(ctx context.Context, raw string) (content, code, msg string) {
+	st := c.deps.Storage
+	if st == nil {
+		return "", "unsupported", "服务器未启用文件消息"
+	}
+	var v FileContent
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return "", "bad_request", "文件消息格式错误"
+	}
+	kind, owner, ok := storage.ParseKey(v.Key)
+	if !ok || kind != "file" || owner != c.userID {
+		return "", "bad_request", "无效的文件"
+	}
+	name := storage.SanitizeFileName(v.Name)
+	if name == "" {
+		return "", "bad_request", "文件名无效"
+	}
+	mime := strings.TrimSpace(v.Mime)
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	if !st.Config().VerifyUpload {
+		if v.Size <= 0 || v.Size > st.Config().FileMaxBytes {
+			return "", "bad_request", "文件大小无效"
+		}
+		out, _ := json.Marshal(FileContent{Key: v.Key, Mime: mime, Size: v.Size, Name: name})
+		return string(out), "", ""
+	}
+	vctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	info, err := st.VerifyFile(vctx, v.Key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return "", "bad_request", "文件未上传或已过期"
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "大小") {
+			return "", "bad_request", err.Error()
+		}
+		slog.Error("verify file", "err", err)
+		return "", "internal", "对象存储错误"
+	}
+	out, _ := json.Marshal(FileContent{Key: v.Key, Mime: mime, Size: info.Size, Name: name})
+	return string(out), "", ""
 }

@@ -88,7 +88,7 @@ func (s *Store) GetGroupMeta(ctx context.Context, cid uint64) (*GroupMeta, error
 // ListMembers 返回群成员（群主、管理员在前）。
 func (s *Store) ListMembers(ctx context.Context, cid uint64) ([]MemberInfo, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT u.id, u.email, u.nickname, u.avatar_url, u.created_at, u.password_hash, m.role, m.read_seq, m.joined_at
+		SELECT u.id, u.email, u.nickname, u.avatar_url, u.created_at, u.password_hash, u.avatar_key, m.role, m.read_seq, m.joined_at
 		FROM conversation_members m JOIN users u ON u.id = m.user_id
 		WHERE m.conversation_id = ? ORDER BY m.role DESC, m.joined_at, m.user_id`, cid)
 	if err != nil {
@@ -99,9 +99,10 @@ func (s *Store) ListMembers(ctx context.Context, cid uint64) ([]MemberInfo, erro
 	for rows.Next() {
 		u := &User{}
 		var mi MemberInfo
-		if err := rows.Scan(&u.ID, &u.Email, &u.Nickname, &u.AvatarURL, &u.CreatedAt, &u.PasswordHash, &mi.Role, &mi.ReadSeq, &mi.JoinedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.Nickname, &u.AvatarURL, &u.CreatedAt, &u.PasswordHash, &u.AvatarKey, &mi.Role, &mi.ReadSeq, &mi.JoinedAt); err != nil {
 			return nil, err
 		}
+		u.ApplyAvatar()
 		mi.User = u
 		out = append(out, mi)
 	}

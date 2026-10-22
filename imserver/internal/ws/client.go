@@ -29,10 +29,11 @@ const (
 
 // Deps 是连接处理需要的外部依赖。
 type Deps struct {
-	Store        *store.Store
-	Push         push.Notifier
-	Storage      *storage.Storage // 为 nil 时不支持语音
-	RecallWindow time.Duration
+	Store           *store.Store
+	Push            push.Notifier
+	Storage         *storage.Storage // 为 nil 时不支持语音
+	RecallWindow    time.Duration
+	CallRingTimeout time.Duration // v0.4.0：通话响铃超时；<=0 时用 60s
 }
 
 type Client struct {
@@ -205,6 +206,18 @@ func (c *Client) handle(env Envelope) {
 		c.handleReact(ctx, env)
 	case "delete":
 		c.handleDelete(ctx, env)
+	case "call_invite":
+		c.handleCallInvite(ctx, env)
+	case "call_accept":
+		c.handleCallAccept(ctx, env)
+	case "call_reject":
+		c.handleCallReject(ctx, env)
+	case "call_cancel":
+		c.handleCallCancel(ctx, env)
+	case "call_hangup":
+		c.handleCallHangup(ctx, env)
+	case "call_signal":
+		c.handleCallSignal(ctx, env)
 	default:
 		c.reply("error", env.ID, errorData{"unknown_type", "未知的消息类型: " + env.Type})
 	}

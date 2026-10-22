@@ -12,12 +12,18 @@ import "encoding/json"
 //	recall  {conversation_id, seq}                 撤回自己的消息（时间窗口内）
 //	react   {conversation_id, seq, emoji, on?}     表情回应；on 省略为切换
 //	delete  {conversation_id, seqs:[...]}          仅自己删除（最多 100 条）
+//	call_invite  {call_id, conversation_id, kind}        v0.4.0：发起 1 对 1 通话（kind: audio|video）
+//	call_accept  {call_id}                               v0.4.0：接听
+//	call_reject  {call_id}                               v0.4.0：拒绝
+//	call_cancel  {call_id}                               v0.4.0：接通前主叫取消
+//	call_hangup  {call_id, reason?}                      v0.4.0：挂断（reason=failed 为本地媒体失败上报）
+//	call_signal  {call_id, signal}                       v0.4.0：WebRTC 协商透传（offer/answer/candidate）
 //	ping    {}
 //
 // 服务端 -> 客户端 type:
 //
 //	send_ack  {message, duplicate}        发送成功回执（含服务端分配的 seq）
-//	message   {message}                   新消息（包括自己其他设备发出的、系统消息）
+//	message   {message}                   新消息（包括自己其他设备发出的、系统消息、通话记录）
 //	read      {conversation_id, user_id, read_seq}
 //	typing    {conversation_id, user_id}
 //	recall    {conversation_id, seq, user_id, recalled_at, mod_seq, message}
@@ -26,6 +32,12 @@ import "encoding/json"
 //	conversation_updated {conversation_id, reason}  群信息/成员变化，客户端刷新会话
 //	conversation_removed {conversation_id, reason}  自己已不在该会话（退群/被移出）
 //	presence  {user_id, online, last_seen}  v0.3.0：共享会话成员上线/离线（仅状态翻转时推送）
+//	call_invite {call_id, conversation_id, from_user_id, kind, created_at}  v0.4.0：来电（被叫全部设备）
+//	call_accept / call_reject / call_cancel / call_hangup {call_id, conversation_id, user_id, reason?}  v0.4.0：通话状态转发
+//	call_signal {call_id, from_user_id, signal}           v0.4.0：WebRTC 协商转发
+//	call_unavailable {call_id, conversation_id, reason}   v0.4.0：服务端终结（offline|busy）
+//	user_updated {user}                    v0.4.0：共享会话成员改了昵称/头像
+//	session_revoked {reason}               v0.4.0：登录态被吊销（改密/重置），随后服务端断开连接
 //	ack       {op, ...}                   recall/react/delete 的请求回执（带请求 id）
 //	pong      {}
 //	error     {code, message}
@@ -85,6 +97,25 @@ type ImageContent struct {
 	Size   int64  `json:"size"`
 	Width  int    `json:"width"`
 	Height int    `json:"height"`
+}
+
+// VideoContent 视频消息（msg_type=4）的 content（v0.4.0）。PosterKey 为封面图的 image/ key，可选。
+type VideoContent struct {
+	Key        string `json:"key"`
+	Mime       string `json:"mime"`
+	Size       int64  `json:"size"`
+	DurationMs int    `json:"duration_ms"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+	PosterKey  string `json:"poster_key,omitempty"`
+}
+
+// FileContent 文件消息（msg_type=5）的 content（v0.4.0）。Name 为清理后的原始文件名。
+type FileContent struct {
+	Key  string `json:"key"`
+	Mime string `json:"mime"`
+	Size int64  `json:"size"`
+	Name string `json:"name"`
 }
 
 // MediaKey 从语音/图片消息 content 中取对象 key 和 MIME（两者字段名相同）。

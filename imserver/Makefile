@@ -1,4 +1,4 @@
-VERSION ?= v0.3.0
+VERSION ?= v0.4.0
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .PHONY: build linux-arm64 linux-amd64 all clean smoketest

@@ -18,6 +18,7 @@ import (
 
 	"imserver/internal/auth"
 	"imserver/internal/config"
+	imail "imserver/internal/mail"
 	"imserver/internal/push"
 	"imserver/internal/storage"
 	"imserver/internal/store"
@@ -32,6 +33,7 @@ type Server struct {
 	push     push.Notifier
 	storage  *storage.Storage // 可能为 nil（未启用对象存储）
 	stt      *stt.Transcriber // 可能为 nil（未启用语音转文字）
+	mailer   *imail.Sender    // 可能为 nil（未启用重置密码发信，v0.4.0）
 	rdb      *redis.Client
 	cfg      *config.Config
 	deps     *ws.Deps
@@ -41,8 +43,10 @@ type Server struct {
 func New(cfg *config.Config, st *store.Store, am *auth.Manager, hub *ws.Hub, p push.Notifier, stg *storage.Storage,
 	tr *stt.Transcriber, rdb *redis.Client) *Server {
 	allowOrigins := cfg.Server.AllowOrigins
-	s := &Server{store: st, auth: am, hub: hub, push: p, storage: stg, stt: tr, rdb: rdb, cfg: cfg}
-	s.deps = &ws.Deps{Store: st, Push: p, Storage: stg, RecallWindow: cfg.Message.RecallWindow()}
+	s := &Server{store: st, auth: am, hub: hub, push: p, storage: stg, stt: tr, rdb: rdb, cfg: cfg, mailer: imail.New(cfg.SMTP)}
+	s.deps = &ws.Deps{Store: st, Push: p, Storage: stg, RecallWindow: cfg.Message.RecallWindow(),
+		CallRingTimeout: time.Duration(cfg.Calls.RingTimeoutSeconds) * time.Second}
+	hub.SetCallStore(st)
 	s.upgrader = websocket.Upgrader{
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
@@ -92,6 +96,13 @@ func (s *Server) Routes() http.Handler {
 	// v0.3.0
 	mux.HandleFunc("GET /api/presence", s.authed(s.presence))
 	mux.HandleFunc("POST /api/conversations/{id}/messages/{seq}/transcribe", s.authed(s.transcribe))
+	// v0.4.0
+	mux.HandleFunc("GET /api/calls/ice-servers", s.authed(s.iceServers))
+	mux.HandleFunc("PATCH /api/me", s.authed(s.updateMe))
+	mux.HandleFunc("POST /api/me/password", s.authed(s.changePassword))
+	mux.HandleFunc("GET /api/users/{id}/avatar", s.authed(s.userAvatar))
+	mux.HandleFunc("POST /api/password/forgot", s.passwordForgot)
+	mux.HandleFunc("POST /api/password/reset", s.passwordReset)
 	mux.HandleFunc("GET /ws", s.websocket)
 	return logRequests(mux)
 }
@@ -125,8 +136,8 @@ func bearer(r *http.Request) string {
 
 func (s *Server) authed(h func(http.ResponseWriter, *http.Request, uint64)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		uid, err := s.auth.Verify(bearer(r))
-		if err != nil {
+		uid, tv, err := s.auth.Verify(bearer(r))
+		if err != nil || !s.tvValid(r.Context(), uid, tv) {
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "未登录或登录已过期")
 			return
 		}
@@ -242,7 +253,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) issue(w http.ResponseWriter, u *store.User, code int) {
-	tok, exp, err := s.auth.Issue(u.ID)
+	tok, exp, err := s.auth.Issue(u.ID, u.TokenVersion)
 	if err != nil {
 		writeErr(w, 500, "internal", "服务器错误")
 		return
@@ -389,8 +400,8 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 	if tok == "" {
 		tok = r.URL.Query().Get("token")
 	}
-	uid, err := s.auth.Verify(tok)
-	if err != nil {
+	uid, tv, err := s.auth.Verify(tok)
+	if err != nil || !s.tvValid(r.Context(), uid, tv) {
 		writeErr(w, 401, "unauthorized", "未登录或登录已过期")
 		return
 	}

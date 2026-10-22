@@ -1,5 +1,5 @@
-# imserver 配置文件（v0.3.0）
-# 所有 v0.3.0 新增键都有默认值，v0.2.0 的配置文件不改也能启动（图片默认开启、语音转文字默认关闭）。
+# imserver 配置文件（v0.4.0）
+# 所有 v0.4.0 新增键都有默认值，v0.3.0 的配置文件不改也能启动（文件/视频默认开启、通话与重置密码默认关闭）。
 # 启动: ./imserver -c config.yaml
 
 server:
@@ -62,6 +62,13 @@ storage:
   # ---------- v0.3.0 新增 ----------
   image_max_bytes: 10485760 # 单张图片最大字节数（10MB）；只允许 JPEG / PNG / WebP / GIF
   image_ttl_days: 0         # 服务器保留图片的天数；0 = 永久保存（不加生命周期规则）
+  # ---------- v0.4.0 新增 ----------
+  file_max_bytes: 104857600  # 单个文件最大字节数（100MB）；文件无格式白名单
+  file_ttl_days: 0           # 服务器保留文件的天数；0 = 永久保存
+  video_max_bytes: 104857600 # 单个视频最大字节数（100MB）；只允许 MP4 / WebM / QuickTime
+  video_max_seconds: 600     # 单个视频最长秒数
+  video_ttl_days: 0          # 服务器保留视频的天数；0 = 永久保存
+  avatar_max_bytes: 2097152  # 头像最大字节数（2MB）；格式同图片
 
 # ---------- v0.3.0 新增：语音转文字 ----------
 # 默认关闭。开启需要对象存储（服务端从存储读取语音再送给提供方）。
@@ -81,6 +88,31 @@ stt:
     api_token: ""           # 需要 Workers AI 权限
     model: "@cf/openai/whisper-large-v3-turbo"
     # base_url: "https://api.cloudflare.com/client/v4"  # 默认值；测试/代理时可改
+
+# ---------- v0.4.0 新增：1 对 1 音视频通话 ----------
+# 媒体走 WebRTC P2P 直连，Cloudflare Realtime TURN 做 NAT 穿透兜底；默认关闭。
+# 注意：本版没有离线推送，对方 App 没有在线连接时打不通（只留一条未接听记录）。
+calls:
+  enabled: false
+  ring_timeout_seconds: 60    # 响铃超时秒数，超时按未接听结束
+  credential_ttl_seconds: 14400 # TURN 临时凭证有效期（秒）
+  turn_key_id: ""             # Cloudflare 控制台 Realtime → TURN 创建的 Key ID
+  turn_api_token: ""          # 对应的 API Token（只存服务端，不要下发给客户端）
+  # base_url: "https://rtc.live.cloudflare.com/v1"  # 默认值；测试/代理时可改
+
+# ---------- v0.4.0 新增：重置密码发信 ----------
+# 默认关闭。开启后登录页显示“忘记密码”，重置链接落在网页端 /reset-password 页。
+smtp:
+  enabled: false
+  host: ""                    # 如 smtp.example.com
+  port: 587
+  username: ""                # 可留空（不做 SMTP AUTH）
+  password: ""
+  from: ""                    # 发件邮箱，如 no-reply@example.com
+  tls_mode: "starttls"        # starttls | tls | none
+  reset_url_base: ""          # 网页端公开地址，如 https://im.fansa.ccwu.cc（拼重置链接用）
+  token_ttl_minutes: 30       # 重置链接有效期（分钟）
+  rate_limit_per_hour: 5      # 同一邮箱每小时最多发几封重置邮件，0 = 不限
 
 log:
   level: "info"            # debug | info | warn | error

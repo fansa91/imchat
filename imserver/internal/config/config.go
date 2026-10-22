@@ -19,6 +19,8 @@ type Config struct {
 	Message MessageConfig `yaml:"message"`
 	Storage StorageConfig `yaml:"storage"`
 	STT     STTConfig     `yaml:"stt"`
+	Calls   CallsConfig   `yaml:"calls"`
+	SMTP    SMTPConfig    `yaml:"smtp"`
 	Log     LogConfig     `yaml:"log"`
 }
 
@@ -86,6 +88,12 @@ type StorageConfig struct {
 	VerifyUpload      bool     `yaml:"verify_upload"`       // 发送语音/图片时服务端检查对象（大小+文件头，2 次请求），默认 true；跨地域可关
 	ImageMaxBytes     int64    `yaml:"image_max_bytes"`     // v0.3.0：单张图片大小上限，默认 10MB
 	ImageTTLDays      int      `yaml:"image_ttl_days"`      // v0.3.0：服务器保留图片的天数，默认 0 = 永久（不加生命周期规则）
+	FileMaxBytes      int64    `yaml:"file_max_bytes"`      // v0.4.0：单个文件大小上限，默认 100MB
+	FileTTLDays       int      `yaml:"file_ttl_days"`       // v0.4.0：服务器保留文件的天数，默认 0 = 永久
+	VideoMaxBytes     int64    `yaml:"video_max_bytes"`     // v0.4.0：单个视频大小上限，默认 100MB
+	VideoMaxSeconds   int      `yaml:"video_max_seconds"`   // v0.4.0：单个视频时长上限，默认 600 秒
+	VideoTTLDays      int      `yaml:"video_ttl_days"`      // v0.4.0：服务器保留视频的天数，默认 0 = 永久
+	AvatarMaxBytes    int64    `yaml:"avatar_max_bytes"`    // v0.4.0：头像大小上限，默认 2MB
 }
 
 // STTConfig 语音转文字（v0.3.0）。默认关闭。
@@ -127,6 +135,40 @@ func (s STTConfig) Configured(provider string) bool {
 		return s.Cloudflare.AccountID != "" && s.Cloudflare.APIToken != ""
 	}
 	return false
+}
+
+// CallsConfig 1 对 1 音视频通话（v0.4.0）：WebRTC P2P + Cloudflare Realtime TURN。默认关闭。
+type CallsConfig struct {
+	Enabled              bool   `yaml:"enabled"`
+	RingTimeoutSeconds   int    `yaml:"ring_timeout_seconds"`   // 响铃超时（秒），默认 60
+	CredentialTTLSeconds int    `yaml:"credential_ttl_seconds"` // TURN 临时凭证有效期（秒），默认 14400
+	TurnKeyID            string `yaml:"turn_key_id"`            // Cloudflare TURN Key ID
+	TurnAPIToken         string `yaml:"turn_api_token"`         // Cloudflare TURN API Token（只存服务端）
+	BaseURL              string `yaml:"base_url"`               // 默认 https://rtc.live.cloudflare.com/v1（测试/代理时可改）
+}
+
+const DefaultCallsBaseURL = "https://rtc.live.cloudflare.com/v1"
+
+// Configured TURN 凭据是否已填写。
+func (c CallsConfig) Configured() bool { return c.TurnKeyID != "" && c.TurnAPIToken != "" }
+
+// SMTPConfig 重置密码发信（v0.4.0）。默认关闭。
+type SMTPConfig struct {
+	Enabled          bool   `yaml:"enabled"`
+	Host             string `yaml:"host"`                // 如 smtp.example.com
+	Port             int    `yaml:"port"`                // 默认 587
+	Username         string `yaml:"username"`            // 可留空（不做 AUTH）
+	Password         string `yaml:"password"`            //
+	From             string `yaml:"from"`                // 发件邮箱，如 no-reply@example.com
+	TLSMode          string `yaml:"tls_mode"`            // starttls | tls | none，默认 starttls
+	ResetURLBase     string `yaml:"reset_url_base"`      // 网页端公开地址（拼重置链接用），如 https://im.fansa.ccwu.cc
+	TokenTTLMinutes  int    `yaml:"token_ttl_minutes"`   // 重置链接有效期（分钟），默认 30
+	RateLimitPerHour int    `yaml:"rate_limit_per_hour"` // 同一邮箱每小时最多发几封（0 = 不限），默认 5
+}
+
+// Configured 发信必需配置（host/from/reset_url_base）是否已填写。
+func (s SMTPConfig) Configured() bool {
+	return s.Host != "" && s.From != "" && s.ResetURLBase != ""
 }
 
 // PublicURL 解析 public_endpoint，返回 host 和是否 https。
@@ -175,6 +217,15 @@ func Load(path string) (*Config, error) {
 			Bucket: "imchat", Region: "garage", VoiceTTLDays: 7, SetLifecycle: true,
 			VoiceMaxBytes: 2 << 20, VoiceMaxSeconds: 60, PresignPutSeconds: 300, PresignGetSeconds: 300, VerifyUpload: true,
 			ImageMaxBytes: 10 << 20, ImageTTLDays: 0,
+			FileMaxBytes: 100 << 20, FileTTLDays: 0,
+			VideoMaxBytes: 100 << 20, VideoMaxSeconds: 600, VideoTTLDays: 0,
+			AvatarMaxBytes: 2 << 20,
+		},
+		Calls: CallsConfig{
+			Enabled: false, RingTimeoutSeconds: 60, CredentialTTLSeconds: 14400, BaseURL: DefaultCallsBaseURL,
+		},
+		SMTP: SMTPConfig{
+			Enabled: false, Port: 587, TLSMode: "starttls", TokenTTLMinutes: 30, RateLimitPerHour: 5,
 		},
 		STT: STTConfig{
 			Enabled: false, Provider: "groq", Fallback: "", Language: "zh", DailyLimitPerUser: 50, TimeoutSeconds: 30,
@@ -239,6 +290,24 @@ func Load(path string) (*Config, error) {
 		if s.ImageTTLDays < 0 {
 			s.ImageTTLDays = 0
 		}
+		if s.FileMaxBytes <= 0 {
+			s.FileMaxBytes = 100 << 20
+		}
+		if s.FileTTLDays < 0 {
+			s.FileTTLDays = 0
+		}
+		if s.VideoMaxBytes <= 0 {
+			s.VideoMaxBytes = 100 << 20
+		}
+		if s.VideoMaxSeconds <= 0 {
+			s.VideoMaxSeconds = 600
+		}
+		if s.VideoTTLDays < 0 {
+			s.VideoTTLDays = 0
+		}
+		if s.AvatarMaxBytes <= 0 {
+			s.AvatarMaxBytes = 2 << 20
+		}
 	}
 	if t := &cfg.STT; t.Enabled {
 		t.Provider = strings.ToLower(strings.TrimSpace(t.Provider))
@@ -277,6 +346,43 @@ func Load(path string) (*Config, error) {
 		if t.Cloudflare.BaseURL == "" {
 			t.Cloudflare.BaseURL = DefaultCloudflareBaseURL
 		}
+	}
+	if c := &cfg.Calls; c.Enabled {
+		if !c.Configured() {
+			return nil, fmt.Errorf("calls.enabled=true 但未配置凭据（turn_key_id / turn_api_token）")
+		}
+		if c.RingTimeoutSeconds <= 0 {
+			c.RingTimeoutSeconds = 60
+		}
+		if c.CredentialTTLSeconds <= 0 {
+			c.CredentialTTLSeconds = 14400
+		}
+		c.BaseURL = strings.TrimRight(c.BaseURL, "/")
+		if c.BaseURL == "" {
+			c.BaseURL = DefaultCallsBaseURL
+		}
+	}
+	if m := &cfg.SMTP; m.Enabled {
+		if !m.Configured() {
+			return nil, fmt.Errorf("smtp.enabled=true 但 smtp.host / smtp.from / smtp.reset_url_base 未填全")
+		}
+		m.TLSMode = strings.ToLower(strings.TrimSpace(m.TLSMode))
+		if m.TLSMode == "" {
+			m.TLSMode = "starttls"
+		}
+		if m.TLSMode != "starttls" && m.TLSMode != "tls" && m.TLSMode != "none" {
+			return nil, fmt.Errorf("smtp.tls_mode 只能是 starttls / tls / none，当前 %q", m.TLSMode)
+		}
+		if m.Port <= 0 {
+			m.Port = 587
+		}
+		if m.TokenTTLMinutes <= 0 {
+			m.TokenTTLMinutes = 30
+		}
+		if m.RateLimitPerHour < 0 {
+			m.RateLimitPerHour = 0
+		}
+		m.ResetURLBase = strings.TrimRight(m.ResetURLBase, "/")
 	}
 	return cfg, nil
 }
