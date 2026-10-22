@@ -65,11 +65,27 @@ jobs:
           (cd release && sha256sum -- *.tar.gz > SHA256SUMS)
           ls -l release && cat release/SHA256SUMS
 
+      - name: 摘录更新说明（CHANGELOG.md 中与 tag 同名的小节）
+        run: |
+          awk -v tag="${TAG}" '
+            BEGIN { h = "## " tag }
+            index($0, h) == 1 && (length($0) == length(h) || substr($0, length(h) + 1, 1) ~ /[[:space:]-]/) { insec = 1; next }
+            insec && /^## / { exit }
+            insec { print }
+          ' CHANGELOG.md > release-notes.md
+          # 去掉首尾空行；没有对应小节时写占位文字（发版前应在 CHANGELOG.md 补好）
+          sed -i -e :a -e '/^\n*$/{$d;N;ba}' -e 's/^\n\+//' release-notes.md || true
+          if [ ! -s release-notes.md ]; then
+            echo "（本版本暂无更新说明）" > release-notes.md
+          fi
+          cat release-notes.md
+
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
+          body_path: release-notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |

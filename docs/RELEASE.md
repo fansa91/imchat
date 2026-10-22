@@ -14,7 +14,14 @@ git pull
 #    - imweb/package.json 的 "version": "0.2.0"
 #    - imserver/config.example.yaml 第一行注释
 
-# 3. 打带注释的标签并推送
+# 3. 写更新说明（自 v0.5.0 起为必做项，用户 2026-10-22 定）：
+#    在 CHANGELOG.md 顶部新增本版本小节，标题格式 `## vX.Y.Z - YYYY-MM-DD`，
+#    内容按「新增 / 修复 / 变更」分类写给用户看的更新内容。
+#    Release workflow 会自动摘录该小节作为 GitHub Release 的更新内容说明
+#    （其后附 GitHub 自动生成的变更列表）；没有对应小节时说明会显示占位文字。
+#    imchat-flutter 仓库同理（各自维护自己的 CHANGELOG.md）。
+
+# 4. 打带注释的标签并推送
 git tag -a v0.2.0 -m "imchat v0.2.0"
 git push origin v0.2.0
 ```
