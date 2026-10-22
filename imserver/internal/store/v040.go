@@ -128,6 +128,10 @@ type CallContent struct {
 	Outcome    string `json:"outcome"` // completed | missed | rejected | cancelled | busy | failed
 	DurationMs int64  `json:"duration_ms"`
 	CallerID   uint64 `json:"caller_id"`
+	// v0.5.0：群通话扩展（omitempty，旧记录无这些字段、按 single 渲染）
+	Mode             string `json:"mode,omitempty"`              // single | group
+	ParticipantCount int    `json:"participant_count,omitempty"` // 群通话：群成员总数
+	JoinedCount      int    `json:"joined_count,omitempty"`      // 群通话：实际加入过的成员数
 }
 
 // InsertCallRecord 以主叫为 sender 插入一条通话记录消息（复用 InsertMessage 的 seq 分配）。

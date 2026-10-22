@@ -34,12 +34,12 @@ func SystemText(content string) string {
 	return "[系统消息]"
 }
 
-// MemberInfo 群成员列表项。
+// MemberInfo 群成员列表项。User 在 v0.5.0 起收紧为 PublicUser（不含 email）。
 type MemberInfo struct {
-	User     *User     `json:"user"`
-	Role     int       `json:"role"`
-	ReadSeq  uint64    `json:"read_seq"`
-	JoinedAt time.Time `json:"joined_at"`
+	User     *PublicUser `json:"user"`
+	Role     int         `json:"role"`
+	ReadSeq  uint64      `json:"read_seq"`
+	JoinedAt time.Time   `json:"joined_at"`
 }
 
 // CreateGroup 创建群聊，owner 为群主，members 为其他成员（已去重、不含 owner）。
@@ -103,7 +103,7 @@ func (s *Store) ListMembers(ctx context.Context, cid uint64) ([]MemberInfo, erro
 			return nil, err
 		}
 		u.ApplyAvatar()
-		mi.User = u
+		mi.User = u.Public()
 		out = append(out, mi)
 	}
 	return out, rows.Err()

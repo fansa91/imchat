@@ -36,8 +36,18 @@ import "encoding/json"
 //	call_accept / call_reject / call_cancel / call_hangup {call_id, conversation_id, user_id, reason?}  v0.4.0：通话状态转发
 //	call_signal {call_id, from_user_id, signal}           v0.4.0：WebRTC 协商转发
 //	call_unavailable {call_id, conversation_id, reason}   v0.4.0：服务端终结（offline|busy）
-//	user_updated {user}                    v0.4.0：共享会话成员改了昵称/头像
+//	user_updated {user}                    v0.4.0：共享会话成员改了昵称/头像（v0.5.0 起 user 为 PublicUser，不含 email）
 //	session_revoked {reason}               v0.4.0：登录态被吊销（改密/重置），随后服务端断开连接
+//	friend_request {request}               v0.5.0：收到新的好友申请
+//	friend_request_accepted {by}           v0.5.0：自己发出的申请被接受（by 为 PublicUser）
+//	friend_request_rejected {by}           v0.5.0：自己发出的申请被拒绝
+//	friend_removed {by}                    v0.5.0：被对方删除好友（by 为对方 user_id）
+//	group_call_started {call_id, conversation_id, kind, creator}   v0.5.0：群里有人发起多人通话（即邀请）
+//	group_call_joined {call_id, user}      v0.5.0：有人加入群通话（user 为 PublicUser）
+//	group_call_tracks {call_id, user_id, tracks}   v0.5.0：有人发布了轨道
+//	group_call_tracks_closed {call_id, user_id, kinds}  v0.5.0：有人关闭了轨道
+//	group_call_left {call_id, user_id}     v0.5.0：有人离开群通话
+//	group_call_ended {call_id, conversation_id}   v0.5.0：群通话结束（通话记录随后以 message 到达）
 //	ack       {op, ...}                   recall/react/delete 的请求回执（带请求 id）
 //	pong      {}
 //	error     {code, message}

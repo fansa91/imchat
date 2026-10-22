@@ -1,5 +1,5 @@
-# imserver 配置文件（v0.4.1）
-# 所有 v0.4.0 新增键都有默认值，v0.3.0 的配置文件不改也能启动（文件/视频默认开启、通话与重置密码默认关闭）。
+# imserver 配置文件（v0.5.0）
+# 所有 v0.4.0 / v0.5.0 新增键都有默认值，旧配置文件不改也能启动（文件/视频默认开启、通话与重置密码默认关闭、多人通话默认关闭）。
 # 启动: ./imserver -c config.yaml
 
 server:
@@ -99,6 +99,12 @@ calls:
   turn_key_id: ""             # Cloudflare 控制台 Realtime → TURN 创建的 Key ID
   turn_api_token: ""          # 对应的 API Token（只存服务端，不要下发给客户端）
   # base_url: "https://rtc.live.cloudflare.com/v1"  # 默认值；测试/代理时可改
+  # ---------- v0.5.0 新增：多人通话（群聊，Cloudflare Realtime SFU） ----------
+  # 与 TURN 是两套凭据：在 Cloudflare 控制台 Realtime → Calls 创建应用后获得 App ID / App Secret。
+  group_enabled: false        # 多人通话总开关
+  group_max_participants: 9   # 单房间人数上限（2~16）
+  sfu_app_id: ""              # Cloudflare Realtime(Calls) 应用 ID
+  sfu_app_secret: ""          # Cloudflare Realtime(Calls) 应用密钥（只存服务端）
 
 # ---------- v0.4.0 新增：重置密码发信 ----------
 # 默认关闭。开启后登录页显示“忘记密码”，重置链接落在网页端 /reset-password 页。

@@ -92,6 +92,8 @@ var upgradeColumns = []struct{ table, column, ddl string }{
 	// v0.4.0
 	{"users", "token_version", "ADD COLUMN token_version INT NOT NULL DEFAULT 0 COMMENT '登录态版本，改密/重置时递增使旧 token 失效' AFTER last_seen_at"},
 	{"users", "avatar_key", "ADD COLUMN avatar_key VARCHAR(512) NOT NULL DEFAULT '' COMMENT '头像对象 key（avatar/ 前缀）' AFTER token_version"},
+	// v0.5.0
+	{"users", "allow_find", "ADD COLUMN allow_find TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否允许通过邮箱/用户 ID 被搜索到' AFTER avatar_key"},
 }
 
 var upgradeIndexes = []struct{ table, index, ddl string }{
@@ -168,6 +170,7 @@ type User struct {
 	PasswordHash string    `json:"-"`
 	AvatarKey    string    `json:"-"` // v0.4.0：头像对象 key；非空时 AvatarURL 拼装为 /api/users/{id}/avatar?v=…
 	TokenVersion int       `json:"-"` // v0.4.0：登录态版本（JWT tv claim 比对用）
+	AllowFind    bool      `json:"-"` // v0.5.0：隐私开关，只经 /api/me 本人视角下发（meResponse 单独拼 allow_find）
 }
 
 // avatarShortHash 头像 key 的短哈希（作 avatar_url 的版本参数，key 变则 URL 变，客户端据此刷新缓存）。
@@ -202,11 +205,11 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, nickname string) (*
 	return s.GetUser(ctx, uint64(id))
 }
 
-const userCols = `id, email, nickname, avatar_url, created_at, password_hash, avatar_key, token_version`
+const userCols = `id, email, nickname, avatar_url, created_at, password_hash, avatar_key, token_version, allow_find`
 
 func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	u := &User{}
-	if err := row.Scan(&u.ID, &u.Email, &u.Nickname, &u.AvatarURL, &u.CreatedAt, &u.PasswordHash, &u.AvatarKey, &u.TokenVersion); err != nil {
+	if err := row.Scan(&u.ID, &u.Email, &u.Nickname, &u.AvatarURL, &u.CreatedAt, &u.PasswordHash, &u.AvatarKey, &u.TokenVersion, &u.AllowFind); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -355,25 +358,25 @@ func (s *Store) IsMember(ctx context.Context, cid, uid uint64) (bool, error) {
 }
 
 type ConversationSummary struct {
-	ID             uint64     `json:"id"`
-	Type           int        `json:"type"`
-	LastSeq        uint64     `json:"last_seq"`
-	ModSeq         uint64     `json:"mod_seq"`
-	ReadSeq        uint64     `json:"read_seq"`
-	JoinSeq        uint64     `json:"join_seq"`
-	Unread         uint64     `json:"unread"`
-	UpdatedAt      time.Time  `json:"updated_at"`
-	Peer           *User      `json:"peer,omitempty"`
-	LastMessage    *Message   `json:"last_message,omitempty"`
-	LastSenderName string     `json:"last_sender_name,omitempty"` // 群聊列表预览“XX：”用
-	Name           string     `json:"name,omitempty"`             // 群名
-	OwnerID        uint64     `json:"owner_id,omitempty"`         // 群主
-	MyRole         int        `json:"my_role"`                    // 我的角色 0/1/2
-	MemberCount    int        `json:"member_count,omitempty"`     // 群成员数
-	MembersPreview []*User    `json:"members_preview,omitempty"`  // 群头像用：最早入群的最多 4 人
-	Announcement   string     `json:"announcement,omitempty"`
-	AnnouncementBy uint64     `json:"announcement_by,omitempty"`
-	AnnouncementAt *time.Time `json:"announcement_at,omitempty"`
+	ID             uint64        `json:"id"`
+	Type           int           `json:"type"`
+	LastSeq        uint64        `json:"last_seq"`
+	ModSeq         uint64        `json:"mod_seq"`
+	ReadSeq        uint64        `json:"read_seq"`
+	JoinSeq        uint64        `json:"join_seq"`
+	Unread         uint64        `json:"unread"`
+	UpdatedAt      time.Time     `json:"updated_at"`
+	Peer           *PublicUser   `json:"peer,omitempty"` // v0.5.0：对端信息收紧为 PublicUser（不含 email）
+	LastMessage    *Message      `json:"last_message,omitempty"`
+	LastSenderName string        `json:"last_sender_name,omitempty"` // 群聊列表预览“XX：”用
+	Name           string        `json:"name,omitempty"`             // 群名
+	OwnerID        uint64        `json:"owner_id,omitempty"`         // 群主
+	MyRole         int           `json:"my_role"`                    // 我的角色 0/1/2
+	MemberCount    int           `json:"member_count,omitempty"`     // 群成员数
+	MembersPreview []*PublicUser `json:"members_preview,omitempty"`  // 群头像用：最早入群的最多 4 人（v0.5.0 起 PublicUser）
+	Announcement   string        `json:"announcement,omitempty"`
+	AnnouncementBy uint64        `json:"announcement_by,omitempty"`
+	AnnouncementAt *time.Time    `json:"announcement_at,omitempty"`
 }
 
 // ListConversations 返回用户所有会话，按最近活跃排序。客户端重连后用 last_seq / mod_seq 判断需要补拉哪些会话。
@@ -426,9 +429,10 @@ func (s *Store) listConversations(ctx context.Context, uid, onlyCID uint64) ([]C
 			return nil, err
 		}
 		if pid.Valid {
-			cs.Peer = &User{ID: uint64(pid.Int64), Email: pemail.String, Nickname: pnick.String,
+			peer := &User{ID: uint64(pid.Int64), Email: pemail.String, Nickname: pnick.String,
 				AvatarURL: pavatar.String, CreatedAt: pcreated.Time, AvatarKey: pavatarkey.String}
-			cs.Peer.ApplyAvatar()
+			peer.ApplyAvatar()
+			cs.Peer = peer.Public()
 		}
 		if annAt.Valid {
 			t := annAt.Time
@@ -466,22 +470,22 @@ func (s *Store) listConversations(ctx context.Context, uid, onlyCID uint64) ([]C
 	return list, nil
 }
 
-func (s *Store) membersPreview(ctx context.Context, cid uint64, n int) ([]*User, error) {
+func (s *Store) membersPreview(ctx context.Context, cid uint64, n int) ([]*PublicUser, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT u.id, u.email, u.nickname, u.avatar_url, u.created_at, u.password_hash, u.avatar_key, u.token_version
+		SELECT u.id, u.email, u.nickname, u.avatar_url, u.created_at, u.password_hash, u.avatar_key, u.token_version, u.allow_find
 		FROM conversation_members m JOIN users u ON u.id = m.user_id
 		WHERE m.conversation_id = ? ORDER BY m.role DESC, m.joined_at, m.user_id LIMIT ?`, cid, n)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []*User
+	var out []*PublicUser
 	for rows.Next() {
 		u, err := scanUser(rows)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, u)
+		out = append(out, u.Public())
 	}
 	return out, rows.Err()
 }

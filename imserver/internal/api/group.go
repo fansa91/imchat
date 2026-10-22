@@ -46,6 +46,9 @@ func (s *Server) clientConfig(w http.ResponseWriter, r *http.Request, uid uint64
 		"video_enabled":             s.storage != nil,
 		"video_max_bytes":           s.cfg.Storage.VideoMaxBytes,
 		"password_reset_enabled":    s.mailer != nil,
+		// v0.5.0
+		"group_call_enabled":          s.cfg.Calls.GroupEnabled && s.cfg.Calls.GroupConfigured(),
+		"group_call_max_participants": s.cfg.Calls.GroupMaxParticipants,
 	}
 	if s.storage != nil {
 		c := s.storage.Config()

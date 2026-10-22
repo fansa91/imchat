@@ -24,7 +24,7 @@ import (
 	"imserver/internal/ws"
 )
 
-var version = "v0.4.1" // 编译时通过 -ldflags "-X main.version=..." 覆盖
+var version = "v0.5.0" // 编译时通过 -ldflags "-X main.version=..." 覆盖
 
 func main() {
 	cfgPath := flag.String("c", "config.yaml", "配置文件路径")

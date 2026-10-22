@@ -3,6 +3,8 @@
 // v0.2：群聊、撤回、仅自己删除、引用回复、表情回应、语音上传（预签名）、生命周期规则。
 // v0.3：图片消息、在线状态（含跨实例）、语音转文字（假提供方）。
 // v0.4：文件/视频消息、头像昵称、重置/修改密码（假 SMTP）、1 对 1 通话信令（假 Cloudflare）。
+// v0.5：好友系统（搜索/申请/备注/删除）、allow_find、退出其他设备、多人通话（假 SFU，借 -v040-base 实例，
+// 需另开 calls.group_enabled 并把 group_max_participants 配 2、sfu_app_id/sfu_app_secret 任意非空）。
 //
 //	-v040-base 指向开启 calls+smtp 的实例（calls.base_url → -calls-stub、smtp → -smtp-stub、tls_mode: none，
 //	ring_timeout_seconds 请配小如 3 以便测响铃超时），留空跳过通话/密码检查。
@@ -203,5 +205,6 @@ func main() {
 	v020(suffix, alice, bob, eve)
 	v030(suffix, alice, bob, eve)
 	v040(suffix, alice, bob, eve)
+	v050(suffix, alice, bob, eve)
 	fmt.Printf("\nALL PASSED (%d checks)\n", passed)
 }

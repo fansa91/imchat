@@ -47,6 +47,7 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, hub *ws.Hub, p p
 	s.deps = &ws.Deps{Store: st, Push: p, Storage: stg, RecallWindow: cfg.Message.RecallWindow(),
 		CallRingTimeout: time.Duration(cfg.Calls.RingTimeoutSeconds) * time.Second}
 	hub.SetCallStore(st)
+	go s.gcallSweeper() // v0.5.0：群通话房间清扫（单人超时 120 秒自动结束）
 	s.upgrader = websocket.Upgrader{
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
@@ -103,6 +104,24 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/users/{id}/avatar", s.authed(s.userAvatar))
 	mux.HandleFunc("POST /api/password/forgot", s.passwordForgot)
 	mux.HandleFunc("POST /api/password/reset", s.passwordReset)
+	// v0.5.0：好友系统 + 退出其他设备 + 多人通话（SFU 代理）
+	mux.HandleFunc("POST /api/me/revoke-other-sessions", s.authed(s.revokeOtherSessions))
+	mux.HandleFunc("GET /api/friends", s.authed(s.listFriends))
+	mux.HandleFunc("PATCH /api/friends/{id}", s.authed(s.updateFriend))
+	mux.HandleFunc("DELETE /api/friends/{id}", s.authed(s.deleteFriend))
+	mux.HandleFunc("POST /api/friends/requests", s.authed(s.createFriendRequest))
+	mux.HandleFunc("GET /api/friends/requests", s.authed(s.listFriendRequests))
+	mux.HandleFunc("POST /api/friends/requests/{id}/accept", s.authed(s.acceptFriendRequest))
+	mux.HandleFunc("POST /api/friends/requests/{id}/reject", s.authed(s.rejectFriendRequest))
+	mux.HandleFunc("DELETE /api/friends/requests/{id}", s.authed(s.withdrawFriendRequest))
+	mux.HandleFunc("POST /api/calls/group", s.authed(s.createGroupCall))
+	mux.HandleFunc("GET /api/calls/group/{call_id}", s.authed(s.getGroupCall))
+	mux.HandleFunc("POST /api/calls/group/{call_id}/join", s.authed(s.joinGroupCall))
+	mux.HandleFunc("POST /api/calls/group/{call_id}/tracks/publish", s.authed(s.publishGroupTracks))
+	mux.HandleFunc("POST /api/calls/group/{call_id}/tracks/subscribe", s.authed(s.subscribeGroupTracks))
+	mux.HandleFunc("POST /api/calls/group/{call_id}/renegotiate", s.authed(s.renegotiateGroupCall))
+	mux.HandleFunc("POST /api/calls/group/{call_id}/tracks/close", s.authed(s.closeGroupTracks))
+	mux.HandleFunc("POST /api/calls/group/{call_id}/leave", s.authed(s.leaveGroupCall))
 	mux.HandleFunc("GET /ws", s.websocket)
 	return logRequests(mux)
 }
@@ -267,21 +286,7 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request, uid uint64) {
 		writeErr(w, 404, "not_found", "用户不存在")
 		return
 	}
-	writeJSON(w, 200, u)
-}
-
-func (s *Server) searchUser(w http.ResponseWriter, r *http.Request, uid uint64) {
-	email, ok := normalizeEmail(r.URL.Query().Get("email"))
-	if !ok {
-		writeErr(w, 400, "bad_email", "邮箱格式不正确")
-		return
-	}
-	u, err := s.store.GetUserByEmail(r.Context(), email)
-	if err != nil {
-		writeErr(w, 404, "not_found", "用户不存在")
-		return
-	}
-	writeJSON(w, 200, u)
+	writeJSON(w, 200, meResponseOf(u))
 }
 
 func (s *Server) openDirect(w http.ResponseWriter, r *http.Request, uid uint64) {

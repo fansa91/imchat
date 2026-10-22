@@ -66,48 +66,46 @@ func (s *Server) revokeUserSessions(ctx context.Context, uid uint64, reason stri
 
 // ---------- 通话 ICE 配置（v0.4.0，SPEC §1.2） ----------
 
-func (s *Server) iceServers(w http.ResponseWriter, r *http.Request, uid uint64) {
+var (
+	errTurnDisabled = errors.New("turn disabled")
+	errTurnFailed   = errors.New("turn generate failed")
+)
+
+// turnICEServers 取该用户的 ICE 配置 JSON（{"iceServers":[...],"expires_at":...}），
+// 按用户在 Redis 缓存（v0.4.0 起，GET /api/calls/ice-servers 与 v0.5.0 群通话响应共用）。
+func (s *Server) turnICEServers(ctx context.Context, uid uint64) ([]byte, error) {
 	cfg := s.cfg.Calls
 	if !cfg.Enabled || !cfg.Configured() {
-		writeErr(w, 501, "call_disabled", "服务器未启用通话")
-		return
+		return nil, errTurnDisabled
 	}
-	ctx := r.Context()
 	cacheKey := "im:turn:" + strconv.FormatUint(uid, 10)
 	if cached, err := s.rdb.Get(ctx, cacheKey).Bytes(); err == nil && len(cached) > 0 {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(200)
-		_, _ = w.Write(cached)
-		return
+		return cached, nil
 	}
 	body, _ := json.Marshal(map[string]int{"ttl": cfg.CredentialTTLSeconds})
 	url := cfg.BaseURL + "/turn/keys/" + cfg.TurnKeyID + "/credentials/generate-ice-servers"
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		writeErr(w, 502, "turn_failed", "获取 TURN 凭证失败")
-		return
+		return nil, errTurnFailed
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.TurnAPIToken)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
 		slog.Warn("turn generate-ice-servers", "err", err)
-		writeErr(w, 502, "turn_failed", "获取 TURN 凭证失败")
-		return
+		return nil, errTurnFailed
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil || resp.StatusCode != 201 {
 		slog.Warn("turn generate-ice-servers bad status", "status", resp.StatusCode)
-		writeErr(w, 502, "turn_failed", "获取 TURN 凭证失败")
-		return
+		return nil, errTurnFailed
 	}
 	var cf struct {
 		IceServers json.RawMessage `json:"iceServers"`
 	}
 	if err := json.Unmarshal(raw, &cf); err != nil || len(cf.IceServers) == 0 {
-		writeErr(w, 502, "turn_failed", "获取 TURN 凭证失败")
-		return
+		return nil, errTurnFailed
 	}
 	expires := time.Now().Add(time.Duration(cfg.CredentialTTLSeconds) * time.Second)
 	out, _ := json.Marshal(map[string]any{
@@ -119,6 +117,19 @@ func (s *Server) iceServers(w http.ResponseWriter, r *http.Request, uid uint64) 
 			slog.Warn("cache turn credentials", "user", uid, "err", err)
 		}
 	}
+	return out, nil
+}
+
+func (s *Server) iceServers(w http.ResponseWriter, r *http.Request, uid uint64) {
+	out, err := s.turnICEServers(r.Context(), uid)
+	if errors.Is(err, errTurnDisabled) {
+		writeErr(w, 501, "call_disabled", "服务器未启用通话")
+		return
+	}
+	if err != nil {
+		writeErr(w, 502, "turn_failed", "获取 TURN 凭证失败")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(200)
 	_, _ = w.Write(out)
@@ -126,14 +137,15 @@ func (s *Server) iceServers(w http.ResponseWriter, r *http.Request, uid uint64) 
 
 // ---------- 头像 / 昵称（v0.4.0，SPEC §3） ----------
 
-// updateMe PATCH /api/me {nickname?, avatar_key?} → 更新后的完整用户对象。
+// updateMe PATCH /api/me {nickname?, avatar_key?, allow_find?} → 更新后的完整用户对象（含 allow_find）。
 func (s *Server) updateMe(w http.ResponseWriter, r *http.Request, uid uint64) {
 	var req struct {
 		Nickname  *string `json:"nickname"`
 		AvatarKey *string `json:"avatar_key"`
+		AllowFind *bool   `json:"allow_find"` // v0.5.0：隐私开关
 	}
-	if err := decode(r, &req); err != nil || (req.Nickname == nil && req.AvatarKey == nil) {
-		writeErr(w, 400, "bad_request", "至少提供 nickname 或 avatar_key")
+	if err := decode(r, &req); err != nil || (req.Nickname == nil && req.AvatarKey == nil && req.AllowFind == nil) {
+		writeErr(w, 400, "bad_request", "至少提供 nickname、avatar_key 或 allow_find")
 		return
 	}
 	ctx := r.Context()
@@ -185,11 +197,22 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request, uid uint64) {
 		writeErr(w, 404, "not_found", "用户不存在")
 		return
 	}
-	u, err := s.store.UpdateUserProfile(ctx, uid, nickname, avatarKey)
-	if err != nil {
-		slog.Error("update profile", "err", err)
-		writeErr(w, 500, "internal", "服务器错误")
-		return
+	u := old
+	if nickname != nil || avatarKey != nil {
+		u, err = s.store.UpdateUserProfile(ctx, uid, nickname, avatarKey)
+		if err != nil {
+			slog.Error("update profile", "err", err)
+			writeErr(w, 500, "internal", "服务器错误")
+			return
+		}
+	}
+	if req.AllowFind != nil {
+		if err := s.store.SetAllowFind(ctx, uid, *req.AllowFind); err != nil {
+			slog.Error("set allow_find", "err", err)
+			writeErr(w, 500, "internal", "服务器错误")
+			return
+		}
+		u.AllowFind = *req.AllowFind
 	}
 	// 头像换新后尽力删除旧对象（失败只记日志）
 	if avatarKey != nil && old.AvatarKey != "" && old.AvatarKey != *avatarKey && s.storage != nil {
@@ -202,14 +225,17 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request, uid uint64) {
 			}
 		}()
 	}
-	// 通知共享会话成员 + 本人所有设备刷新昵称/头像（范围同 presence：CoMembers + 本人）
-	targets, err := s.store.CoMembers(ctx, uid)
-	if err == nil {
-		s.hub.Publish(ctx, append(targets, uid), "", ws.Encode("user_updated", map[string]any{"user": u}))
-	} else {
-		slog.Warn("user_updated co-members", "user", uid, "err", err)
+	// 通知共享会话成员 + 本人所有设备刷新昵称/头像（范围同 presence：CoMembers + 本人）。
+	// 只在昵称/头像变化时推；payload 是他人视角，v0.5.0 起收紧为 PublicUser。
+	if nickname != nil || avatarKey != nil {
+		targets, err := s.store.CoMembers(ctx, uid)
+		if err == nil {
+			s.hub.Publish(ctx, append(targets, uid), "", ws.Encode("user_updated", map[string]any{"user": u.Public()}))
+		} else {
+			slog.Warn("user_updated co-members", "user", uid, "err", err)
+		}
 	}
-	writeJSON(w, 200, u)
+	writeJSON(w, 200, meResponseOf(u))
 }
 
 // userAvatar GET /api/users/{id}/avatar → 302 跳转到短期预签名 GET。

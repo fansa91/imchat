@@ -137,7 +137,8 @@ func (s STTConfig) Configured(provider string) bool {
 	return false
 }
 
-// CallsConfig 1 对 1 音视频通话（v0.4.0）：WebRTC P2P + Cloudflare Realtime TURN。默认关闭。
+// CallsConfig 音视频通话：1 对 1 走 WebRTC P2P + Cloudflare Realtime TURN（v0.4.0），
+// 多人通话走 Cloudflare Realtime SFU（v0.5.0）。两者默认关闭、凭据互相独立。
 type CallsConfig struct {
 	Enabled              bool   `yaml:"enabled"`
 	RingTimeoutSeconds   int    `yaml:"ring_timeout_seconds"`   // 响铃超时（秒），默认 60
@@ -145,12 +146,20 @@ type CallsConfig struct {
 	TurnKeyID            string `yaml:"turn_key_id"`            // Cloudflare TURN Key ID
 	TurnAPIToken         string `yaml:"turn_api_token"`         // Cloudflare TURN API Token（只存服务端）
 	BaseURL              string `yaml:"base_url"`               // 默认 https://rtc.live.cloudflare.com/v1（测试/代理时可改）
+	// v0.5.0 多人通话（SFU）
+	GroupEnabled         bool   `yaml:"group_enabled"`          // 多人通话总开关
+	GroupMaxParticipants int    `yaml:"group_max_participants"` // 单房间人数上限（2–16），默认 9
+	SFUAppID             string `yaml:"sfu_app_id"`             // Cloudflare Realtime(Calls) 应用 ID
+	SFUAppSecret         string `yaml:"sfu_app_secret"`         // Cloudflare Realtime(Calls) 应用密钥（只存服务端）
 }
 
 const DefaultCallsBaseURL = "https://rtc.live.cloudflare.com/v1"
 
 // Configured TURN 凭据是否已填写。
 func (c CallsConfig) Configured() bool { return c.TurnKeyID != "" && c.TurnAPIToken != "" }
+
+// GroupConfigured SFU（Calls 应用）凭据是否已填写。与 TURN 凭据是两套，不通用。
+func (c CallsConfig) GroupConfigured() bool { return c.SFUAppID != "" && c.SFUAppSecret != "" }
 
 // SMTPConfig 重置密码发信（v0.4.0）。默认关闭。
 type SMTPConfig struct {
@@ -223,6 +232,7 @@ func Load(path string) (*Config, error) {
 		},
 		Calls: CallsConfig{
 			Enabled: false, RingTimeoutSeconds: 60, CredentialTTLSeconds: 14400, BaseURL: DefaultCallsBaseURL,
+			GroupEnabled: false, GroupMaxParticipants: 9,
 		},
 		SMTP: SMTPConfig{
 			Enabled: false, Port: 587, TLSMode: "starttls", TokenTTLMinutes: 30, RateLimitPerHour: 5,
@@ -347,10 +357,7 @@ func Load(path string) (*Config, error) {
 			t.Cloudflare.BaseURL = DefaultCloudflareBaseURL
 		}
 	}
-	if c := &cfg.Calls; c.Enabled {
-		if !c.Configured() {
-			return nil, fmt.Errorf("calls.enabled=true 但未配置凭据（turn_key_id / turn_api_token）")
-		}
+	if c := &cfg.Calls; c.Enabled || c.GroupEnabled {
 		if c.RingTimeoutSeconds <= 0 {
 			c.RingTimeoutSeconds = 60
 		}
@@ -360,6 +367,17 @@ func Load(path string) (*Config, error) {
 		c.BaseURL = strings.TrimRight(c.BaseURL, "/")
 		if c.BaseURL == "" {
 			c.BaseURL = DefaultCallsBaseURL
+		}
+	}
+	if c := &cfg.Calls; c.Enabled && !c.Configured() {
+		return nil, fmt.Errorf("calls.enabled=true 但未配置凭据（turn_key_id / turn_api_token）")
+	}
+	if c := &cfg.Calls; c.GroupEnabled {
+		if !c.GroupConfigured() {
+			return nil, fmt.Errorf("calls.group_enabled=true 但未配置凭据（sfu_app_id / sfu_app_secret）")
+		}
+		if c.GroupMaxParticipants < 2 || c.GroupMaxParticipants > 16 {
+			return nil, fmt.Errorf("calls.group_max_participants 必须在 2~16 之间，当前 %d", c.GroupMaxParticipants)
 		}
 	}
 	if m := &cfg.SMTP; m.Enabled {
