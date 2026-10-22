@@ -42,6 +42,13 @@ func (s *sfuStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.Contains(path, "/credentials/generate-ice-servers") && r.Method == "POST":
 		write(201, `{"iceServers":[{"urls":["stun:stun.cloudflare.com:3478"]},{"urls":["turn:turn.cloudflare.com:3478?transport=udp"],"username":"stubuser","credential":"stubcred"}]}`)
 	case strings.HasSuffix(path, "/sessions/new") && r.Method == "POST":
+		// 真实 API 该接口不收请求体：带体（含 {}）回 400 decoding_error
+		// （2026-10-22 生产实测）。桩照此拒绝，防客户端再多发请求体。
+		body, _ := io.ReadAll(r.Body)
+		if len(strings.TrimSpace(string(body))) > 0 {
+			write(400, `{"errorCode":"decoding_error","errorDescription":"Body JSON validation error: sessionDescription"}`)
+			return
+		}
 		s.mu.Lock()
 		s.seq++
 		n := s.seq

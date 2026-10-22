@@ -166,22 +166,35 @@ func (s *Server) sfuRequest(ctx context.Context, method, path string, body []byt
 
 func (s *Server) sfuSessionPath() string { return "/apps/" + s.cfg.Calls.SFUAppID + "/sessions" }
 
+// sfuRespSnippet 截取 SFU 错误回应体（只含 errorCode/errorDescription 类
+// 信息，不含凭据）供日志定位；成功回应的 SDP 不经此路（只在错误分支调用）。
+func sfuRespSnippet(raw []byte) string {
+	const max = 512
+	if len(raw) > max {
+		raw = raw[:max]
+	}
+	return string(raw)
+}
+
 // sfuNewSession 在 Cloudflare Calls 侧为某参与者新建独立 session。
+// 注意：该接口必须不带请求体——发 {} 会被 Cloudflare 以 400
+// decoding_error（Body JSON validation error: sessionDescription）拒绝
+// （2026-10-22 生产实测：带 {} 400、无体返回 sessionId）。
 func (s *Server) sfuNewSession(ctx context.Context) (string, error) {
-	status, raw, err := s.sfuRequest(ctx, "POST", s.sfuSessionPath()+"/new", []byte("{}"))
+	status, raw, err := s.sfuRequest(ctx, "POST", s.sfuSessionPath()+"/new", nil)
 	if err != nil {
 		slog.Warn("sfu new session", "err", err)
 		return "", errSFUFailed
 	}
 	if status != 200 && status != 201 {
-		slog.Warn("sfu new session bad status", "status", status)
+		slog.Warn("sfu new session bad status", "status", status, "resp", sfuRespSnippet(raw))
 		return "", errSFUFailed
 	}
 	var out struct {
 		SessionID string `json:"sessionId"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil || out.SessionID == "" {
-		slog.Warn("sfu new session bad response")
+		slog.Warn("sfu new session bad response", "resp", sfuRespSnippet(raw))
 		return "", errSFUFailed
 	}
 	return out.SessionID, nil
@@ -503,7 +516,7 @@ func (s *Server) sfuTracksNew(ctx context.Context, sessionID string, tracks []ma
 		return nil, nil, errSFUFailed
 	}
 	if status != 200 {
-		slog.Warn("sfu tracks/new bad status", "status", status)
+		slog.Warn("sfu tracks/new bad status", "status", status, "resp", sfuRespSnippet(respRaw))
 		return nil, nil, errSFUFailed
 	}
 	var parsed cfTracksResponse
@@ -657,7 +670,7 @@ func (s *Server) renegotiateGroupCall(w http.ResponseWriter, r *http.Request, ui
 		if err != nil {
 			slog.Warn("sfu renegotiate", "err", err)
 		} else {
-			slog.Warn("sfu renegotiate bad status", "status", status)
+			slog.Warn("sfu renegotiate bad status", "status", status, "resp", sfuRespSnippet(raw))
 		}
 		writeErr(w, 502, "sfu_failed", "重协商失败，请稍后重试")
 		return
@@ -725,7 +738,7 @@ func (s *Server) closeGroupTracks(w http.ResponseWriter, r *http.Request, uid ui
 		if err != nil {
 			slog.Warn("sfu tracks/close", "err", err)
 		} else {
-			slog.Warn("sfu tracks/close bad status", "status", status)
+			slog.Warn("sfu tracks/close bad status", "status", status, "resp", sfuRespSnippet(raw))
 		}
 		writeErr(w, 502, "sfu_failed", "关闭轨道失败，请稍后重试")
 		return
