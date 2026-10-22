@@ -160,7 +160,9 @@ func (s *Server) updateMe(w http.ResponseWriter, r *http.Request, uid uint64) {
 				return
 			}
 			if s.storage.Config().VerifyUpload {
-				size, err := s.storage.Size(ctx, k)
+				// 用带重试的 Size：服务端经公网域名访问存储时 StatObject 偶发瞬时
+				// 错误，单次失败直接 500 会让头像设置间歇不可用（v0.4.0 实测）。
+				size, err := s.storage.SizeWithRetry(ctx, k)
 				if errors.Is(err, storage.ErrNotFound) {
 					writeErr(w, 400, "bad_avatar", "头像文件未上传")
 					return

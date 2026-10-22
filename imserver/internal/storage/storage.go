@@ -578,6 +578,35 @@ func (s *Storage) Size(ctx context.Context, key string) (int64, error) {
 	return st.Size, nil
 }
 
+// SizeWithRetry 在 Size 之上对瞬时错误做有限重试（最多 4 次，间隔 200/500/1000ms）。
+// 背景：生产环境服务端访问存储走公网域名（Cloudflare → Caddy → Garage），StatObject
+// 偶发非 NoSuchKey 错误（连接重置 / 上游 5xx / 边缘节点拒绝），单次失败就让整个
+// 请求报错会把偶发抖动放大成功能不可用（v0.4.0 头像设置间歇 500 即此因）。
+// ErrNotFound 是确定性结果，不重试；ctx 取消时立即返回。
+func (s *Storage) SizeWithRetry(ctx context.Context, key string) (int64, error) {
+	backoff := []time.Duration{200 * time.Millisecond, 500 * time.Millisecond, time.Second}
+	var lastErr error
+	for attempt := 0; attempt <= len(backoff); attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(backoff[attempt-1]):
+			}
+		}
+		size, err := s.Size(ctx, key)
+		if err == nil {
+			return size, nil
+		}
+		if errors.Is(err, ErrNotFound) {
+			return 0, err
+		}
+		lastErr = err
+		slog.Warn("stat object transient error, retrying", "key", key, "attempt", attempt+1, "err", err)
+	}
+	return 0, lastErr
+}
+
 // Read 读取整个对象（语音转文字用），超过 maxBytes 报错。对象不存在返回 ErrNotFound。
 func (s *Storage) Read(ctx context.Context, key string, maxBytes int64) ([]byte, error) {
 	obj, err := s.cli.GetObject(ctx, s.cfg.Bucket, key, minio.GetObjectOptions{})
